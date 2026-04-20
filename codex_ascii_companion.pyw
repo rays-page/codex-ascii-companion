@@ -27,7 +27,8 @@ DELIVERED_HOLD_SECONDS = 2.0
 ERROR_HOLD_SECONDS = 6.0
 NEW_PROCESS_BONUS = 0.06
 ACTIVE_CPU_THRESHOLD = 0.015
-ROOT_ACTIVE_CPU_THRESHOLD = 0.012
+ROOT_THINKING_CPU_THRESHOLD = 0.05
+ROOT_THINKING_MIN_STREAK = 2
 SETTINGS_FILENAME = "companion_settings.json"
 DEBUG_LOG_LIMIT = 16
 TRANSPARENT_KEY = "#010203"
@@ -519,6 +520,7 @@ class CompanionApp:
         self.delivered_until = 0.0
         self.last_tool_activity_at = 0.0
         self.last_root_activity_at = 0.0
+        self.root_activity_streak = 0
         self.last_descendant_seen_at = 0.0
         self.last_successful_poll_at = 0.0
         self.activity_hint = ""
@@ -724,6 +726,8 @@ class CompanionApp:
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
         self.drag_start = (event.x_root, event.y_root)
         self.drag_moved = False
+        self.nudge_until = time.monotonic() + PING_SECONDS
+        self._log_debug("acknowledged contact")
 
     def _drag(self, event: tk.Event[tk.Misc]) -> None:
         if abs(event.x_root - self.drag_start[0]) + abs(event.y_root - self.drag_start[1]) >= 3:
@@ -739,8 +743,7 @@ class CompanionApp:
             self._remember_window_position(docked=False)
             self._log_debug("moved pod")
             return
-        self.nudge_until = time.monotonic() + PING_SECONDS
-        self._log_debug("acknowledged click")
+        self._log_debug("click released")
 
     def _double_click(self, _event: tk.Event[tk.Misc]) -> None:
         self.nudge_until = time.monotonic() + PING_SECONDS
@@ -786,6 +789,7 @@ class CompanionApp:
         self.last_snapshot.clear()
         self.last_tool_activity_at = 0.0
         self.last_root_activity_at = 0.0
+        self.root_activity_streak = 0
         self.last_descendant_seen_at = 0.0
         self.root_pid = None
         self.root_cpu_delta = 0.0
@@ -901,6 +905,7 @@ class CompanionApp:
             f"source     {self.last_active_source or '-'}",
             f"poll gen   {self.poll_generation} / {self.inflight_generation if self.inflight_generation is not None else '-'}",
             f"root cpu   {self.root_cpu_delta:.3f} (pid {self.root_pid or '-'})",
+            f"root gate  {self.root_activity_streak}/{ROOT_THINKING_MIN_STREAK} over {ROOT_THINKING_CPU_THRESHOLD:.3f}",
             f"desc       {self.last_sample.descendants} total, {self.last_sample.hot_descendants} hot, {self.last_sample.new_descendants} new",
             f"kind       {self.last_sample.phase_kind}",
             f"last poll  {self._age_text(self.last_successful_poll_at)} ago",
@@ -1325,10 +1330,16 @@ class CompanionApp:
         return sample.source_name
 
     def _derive_state(self, sample: ActivitySnapshot, now: float) -> tuple[str, str, str]:
-        root_hot = sample.root_cpu_delta >= ROOT_ACTIVE_CPU_THRESHOLD
+        root_hot = sample.root_cpu_delta >= ROOT_THINKING_CPU_THRESHOLD
 
-        if root_hot:
+        if sample.descendants:
+            self.root_activity_streak = 0
+        elif root_hot:
             self.last_root_activity_at = now
+            self.root_activity_streak = min(self.root_activity_streak + 1, ROOT_THINKING_MIN_STREAK + 2)
+        elif now - self.last_root_activity_at >= THINKING_HOLD_SECONDS:
+            self.root_activity_streak = 0
+
         if sample.descendants:
             self.last_descendant_seen_at = now
             if self.last_tool_activity_at <= 0.0:
@@ -1339,7 +1350,11 @@ class CompanionApp:
             self.last_active_source = self._format_source(sample)
 
         quiet_for = now - self.last_tool_activity_at if self.last_tool_activity_at > 0.0 else 999.0
-        root_recent = now - self.last_root_activity_at < THINKING_HOLD_SECONDS
+        root_recent = (
+            not sample.descendants
+            and self.root_activity_streak >= ROOT_THINKING_MIN_STREAK
+            and now - self.last_root_activity_at < THINKING_HOLD_SECONDS
+        )
         had_active_visual = self.visual_state in ACTIVE_VISUAL_STATES
         state = "idle"
         hint = sample.hint
@@ -1350,10 +1365,6 @@ class CompanionApp:
                 state = "building"
             elif sample.hot_descendants or sample.new_descendants:
                 state = "tooling"
-            elif root_hot and quiet_for < WAITING_GRACE_SECONDS:
-                state = "thinking"
-                hint = ""
-                reason = f"app-server cpu +{sample.root_cpu_delta:.3f}"
             elif quiet_for >= WAITING_GRACE_SECONDS:
                 state = "waiting"
             else:
@@ -1361,7 +1372,7 @@ class CompanionApp:
         elif root_recent:
             state = "thinking"
             hint = ""
-            reason = f"app-server cpu +{sample.root_cpu_delta:.3f}" if root_hot else "app-server active"
+            reason = f"sustained app-server cpu ({self.root_activity_streak} polls)"
 
         if state in ACTIVE_VISUAL_STATES:
             self.delivered_until = 0.0
