@@ -31,6 +31,8 @@ STATE_QUOTES = {
     "paused": "sensing off",
     "error": "lost sync",
 }
+ART_SHADOW_COLOR = "#223326"
+QUOTE_SHADOW_COLOR = "#203024"
 STATE_ART_COLORS = {
     "boot": "#c8e6ff",
     "idle": "#c8ffab",
@@ -348,10 +350,10 @@ class CompanionApp:
             cursor="hand2",
         )
         self.shadow_far_item = self.canvas.create_text(
-            2,
-            2,
-            text=initial_art,
-            fill="#07100a",
+            0,
+            0,
+            text="",
+            fill=ART_SHADOW_COLOR,
             font=self.art_font,
             anchor="nw",
             justify="left",
@@ -360,7 +362,7 @@ class CompanionApp:
             1,
             1,
             text=initial_art,
-            fill="#173426",
+            fill=ART_SHADOW_COLOR,
             font=self.art_font,
             anchor="nw",
             justify="left",
@@ -375,16 +377,16 @@ class CompanionApp:
             justify="left",
         )
         self.quote_shadow_item = self.canvas.create_text(
-            2,
+            1,
             height + 4,
             text=STATE_QUOTES["boot"],
-            fill="#08110b",
+            fill=QUOTE_SHADOW_COLOR,
             font=self.quote_font,
             anchor="nw",
             justify="left",
         )
         self.quote_item = self.canvas.create_text(
-            1,
+            0,
             height + 3,
             text=STATE_QUOTES["boot"],
             fill=STATE_QUOTE_COLORS["boot"],
@@ -523,7 +525,7 @@ class CompanionApp:
         last = len(line.rstrip()) - 1
         return font.measure(line[:first]), font.measure(line[: last + 1])
 
-    def _update_window_region(self, art: str, quote: str) -> None:
+    def _update_window_region(self, art: str, quote: str, art_x: int, quote_x: int, quote_y: int) -> None:
         if os.name != "nt":
             return
         self.root.update_idletasks()
@@ -531,8 +533,8 @@ class CompanionApp:
         origin_y = self.canvas.winfo_y()
         base_region = None
         region_specs = (
-            (art.splitlines() or [""], self.art_font, origin_x, origin_y),
-            ((quote.splitlines() or [""]) if quote else [], self.quote_font, origin_x, origin_y + self._measure_text(art, self.art_font)[1] + 3),
+            (art.splitlines() or [""], self.art_font, origin_x + art_x, origin_y),
+            ((quote.splitlines() or [""]) if quote else [], self.quote_font, origin_x + quote_x, origin_y + quote_y),
         )
         for lines, font, x_origin, y_origin in region_specs:
             line_height = font.metrics("linespace")
@@ -565,18 +567,23 @@ class CompanionApp:
         quote_width, quote_height = self._measure_text(quote, self.quote_font) if quote else (0, 0)
         content_width = max(art_width, quote_width)
         content_height = art_height + (quote_height + 4 if quote else 0)
+        pad_x = 2
+        pad_y = 2
+        art_x = pad_x + (content_width - art_width) // 2
+        quote_x = pad_x + (content_width - quote_width) // 2 if quote else pad_x
+        quote_y = pad_y + art_height + 3
         self.canvas.configure(width=content_width + 4, height=content_height + 4)
-        self.canvas.itemconfigure(self.shadow_far_item, text=art)
-        self.canvas.itemconfigure(self.shadow_near_item, text=art)
+        self.canvas.itemconfigure(self.shadow_far_item, text="")
+        self.canvas.itemconfigure(self.shadow_near_item, text=art, fill=ART_SHADOW_COLOR)
         self.canvas.itemconfigure(self.art_item, text=art, fill=STATE_ART_COLORS[state])
-        self.canvas.coords(self.shadow_far_item, 2, 2)
-        self.canvas.coords(self.shadow_near_item, 1, 1)
-        self.canvas.coords(self.art_item, 0, 0)
-        self.canvas.itemconfigure(self.quote_shadow_item, text=quote)
+        self.canvas.coords(self.shadow_far_item, 0, 0)
+        self.canvas.coords(self.shadow_near_item, art_x + 1, pad_y + 1)
+        self.canvas.coords(self.art_item, art_x, pad_y)
+        self.canvas.itemconfigure(self.quote_shadow_item, text=quote, fill=QUOTE_SHADOW_COLOR)
         self.canvas.itemconfigure(self.quote_item, text=quote, fill=STATE_QUOTE_COLORS[state])
-        self.canvas.coords(self.quote_shadow_item, 2, art_height + 4)
-        self.canvas.coords(self.quote_item, 1, art_height + 3)
-        self._update_window_region(art, quote)
+        self.canvas.coords(self.quote_shadow_item, quote_x + 1, quote_y + 1)
+        self.canvas.coords(self.quote_item, quote_x, quote_y)
+        self._update_window_region(art, quote, art_x, quote_x, quote_y)
 
     def _animate(self) -> None:
         state = self._current_state()
