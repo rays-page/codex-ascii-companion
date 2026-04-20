@@ -19,9 +19,12 @@ FRAME_MS = 260
 BUSY_HOLD_SECONDS = 1.6
 ERROR_HOLD_SECONDS = 6.0
 TRANSPARENT_KEY = "#010203"
-RGN_OR = 2
 HIT_PAD_X = 3
 HIT_PAD_Y = 2
+GWL_WNDPROC = -4
+WM_NCHITTEST = 0x0084
+HTCLIENT = 1
+HTTRANSPARENT = -1
 IGNORED_CODEX_CHILD_STEMS = {"conhost"}
 IGNORED_CODEX_COMMAND_SNIPPETS = ("-encodedcommand",)
 STATE_QUOTES = {
@@ -326,9 +329,16 @@ class CompanionApp:
         self.poll_generation = 0
         self.inflight_generation: int | None = None
         self.nudge_until = 0.0
+        self.hit_rects: list[tuple[int, int, int, int]] = []
+        self._wndproc = None
+        self._old_wndproc = None
+        self._set_window_long_ptr = None
+        self._call_window_proc = None
+        self._long_ptr_type = None
 
         self._build_ui()
         self._bind_events()
+        self._install_hit_test_hook()
         self._dock_above_clock()
         self.root.after(160, self._animate)
         self.root.after(0, self._schedule_poll)
@@ -525,16 +535,64 @@ class CompanionApp:
         last = len(line.rstrip()) - 1
         return font.measure(line[:first]), font.measure(line[: last + 1])
 
-    def _update_window_region(self, art: str, quote: str, art_x: int, quote_x: int, quote_y: int) -> None:
+    def _point_in_hit_shape(self, x: int, y: int) -> bool:
+        for left, top, right, bottom in self.hit_rects:
+            if left <= x < right and top <= y < bottom:
+                return True
+        return False
+
+    def _install_hit_test_hook(self) -> None:
         if os.name != "nt":
             return
-        self.root.update_idletasks()
-        origin_x = self.canvas.winfo_x()
-        origin_y = self.canvas.winfo_y()
-        base_region = None
+        long_ptr = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        wndproc_type = ctypes.WINFUNCTYPE(long_ptr, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32 = ctypes.windll.user32
+        user32.SetWindowLongPtrW.restype = long_ptr
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+        user32.CallWindowProcW.restype = long_ptr
+        user32.CallWindowProcW.argtypes = [long_ptr, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        self._set_window_long_ptr = user32.SetWindowLongPtrW
+        self._call_window_proc = user32.CallWindowProcW
+        self._long_ptr_type = long_ptr
+
+        def wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+            if msg == WM_NCHITTEST:
+                x = ctypes.c_short(lparam & 0xFFFF).value - self.root.winfo_rootx()
+                y = ctypes.c_short((lparam >> 16) & 0xFFFF).value - self.root.winfo_rooty()
+                if self._point_in_hit_shape(x, y):
+                    return HTCLIENT
+                return HTTRANSPARENT
+            return self._call_window_proc(self._old_wndproc, hwnd, msg, wparam, lparam)
+
+        self._wndproc = wndproc_type(wndproc)
+        self._old_wndproc = self._set_window_long_ptr(
+            self.root.winfo_id(),
+            GWL_WNDPROC,
+            long_ptr(ctypes.cast(self._wndproc, ctypes.c_void_p).value),
+        )
+        self.root.bind("<Destroy>", self._restore_hit_test_hook, add=True)
+
+    def _restore_hit_test_hook(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is not self.root:
+            return
+        if not (self._old_wndproc and self._set_window_long_ptr and self._long_ptr_type):
+            return
+        try:
+            self._set_window_long_ptr(
+                self.root.winfo_id(),
+                GWL_WNDPROC,
+                self._long_ptr_type(self._old_wndproc),
+            )
+        except Exception:
+            pass
+        finally:
+            self._old_wndproc = None
+
+    def _update_hit_shape(self, art: str, quote: str, art_x: int, quote_x: int, quote_y: int) -> None:
+        rects: list[tuple[int, int, int, int]] = []
         region_specs = (
-            (art.splitlines() or [""], self.art_font, origin_x + art_x, origin_y),
-            ((quote.splitlines() or [""]) if quote else [], self.quote_font, origin_x + quote_x, origin_y + quote_y),
+            (art.splitlines() or [""], self.art_font, art_x, 2),
+            ((quote.splitlines() or [""]) if quote else [], self.quote_font, quote_x, quote_y),
         )
         for lines, font, x_origin, y_origin in region_specs:
             line_height = font.metrics("linespace")
@@ -544,22 +602,15 @@ class CompanionApp:
                     continue
                 left, right = bounds
                 top = y_origin + (row * line_height)
-                region = ctypes.windll.gdi32.CreateRectRgn(
-                    x_origin + left - HIT_PAD_X,
-                    top - HIT_PAD_Y,
-                    x_origin + right + HIT_PAD_X + 3,
-                    top + line_height + HIT_PAD_Y + 3,
+                rects.append(
+                    (
+                        x_origin + left - HIT_PAD_X,
+                        top - HIT_PAD_Y,
+                        x_origin + right + HIT_PAD_X + 3,
+                        top + line_height + HIT_PAD_Y + 3,
+                    )
                 )
-                if base_region is None:
-                    base_region = region
-                else:
-                    ctypes.windll.gdi32.CombineRgn(base_region, base_region, region, RGN_OR)
-                    ctypes.windll.gdi32.DeleteObject(region)
-        if base_region is None:
-            ctypes.windll.user32.SetWindowRgn(self.root.winfo_id(), 0, True)
-            return
-        if not ctypes.windll.user32.SetWindowRgn(self.root.winfo_id(), base_region, True):
-            ctypes.windll.gdi32.DeleteObject(base_region)
+        self.hit_rects = rects
 
     def _set_display(self, state: str, art: str) -> None:
         art_width, art_height = self._measure_text(art, self.art_font)
@@ -583,7 +634,7 @@ class CompanionApp:
         self.canvas.itemconfigure(self.quote_item, text=quote, fill=STATE_QUOTE_COLORS[state])
         self.canvas.coords(self.quote_shadow_item, quote_x + 1, quote_y + 1)
         self.canvas.coords(self.quote_item, quote_x, quote_y)
-        self._update_window_region(art, quote, art_x, quote_x, quote_y)
+        self._update_hit_shape(art, quote, art_x, quote_x, quote_y)
 
     def _animate(self) -> None:
         state = self._current_state()
