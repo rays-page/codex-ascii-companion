@@ -1,0 +1,57 @@
+Use $check-in at C:\Users\raymo_w9whwcn\.codex\skills\check-in\SKILL.md.
+
+Project root:
+C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion
+
+Open these first:
+- C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion\PASTE_INTO_NEW_THREAD_CHECK_IN.txt
+- C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion\NEXT_THREAD_PLAN.md
+- C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion\codex_ascii_companion.pyw
+
+Live repo expectations:
+- git repo
+- branch: main
+- head: 80851bd
+- dirty files expected: NEXT_THREAD_PLAN.md, README.md, codex_ascii_companion.pyw
+- untracked file expected: PASTE_INTO_NEW_THREAD_CHECK_IN.txt
+
+Current truth:
+- The companion already has a confidence-gated sensing pass, rolling diagnostics trace, calmer ambiguous-state copy, and a lightweight reasoning probe.
+- The reasoning probe tails the active Codex rollout jsonl and looks for live `response_item` reasoning events.
+- Tool/build detection is still separate from reasoning detection.
+- The reasoning probe only matters in the no-child-path root-work case and boosts `thinking` instead of replacing the existing evidence model.
+- Diagnostics now show reasoning hit or miss, age, and recent sensor trace context for the decision.
+- Read-only live validation on 2026-04-20 confirmed real rollout reasoning hits arrive before assistant messages and then clear to `rollout already answered`.
+- Read-only live validation on 2026-04-20 confirmed a real child `python.exe` tool path chooses `tooling` and still rejects `thinking` with `child path present`.
+- The most recent observed reasoning-to-assistant gap was about `1.5s`, which still fits inside the current `550 ms` poll and `0.9 s` probe cadence.
+- GUI-facing diagnostics validation on 2026-04-20 confirmed a real `idle -> thinking` transition from `rollout reasoning hit 0.6s ago`.
+- That same live diagnostics pass also showed the pod clear back through `thinking -> delivered`, and a live child tool path still forced `tooling` with `thinking held: child path present`.
+- No timing-window code changes were needed from the first GUI-facing validation pass.
+- Optimization pass on 2026-04-20 reduced background churn without changing sensing thresholds:
+  - the process snapshot command is now reused instead of rebuilt every poll
+  - the rollout probe now parses only newly appended jsonl lines and only briefly reuses the previous rollout path before rescanning
+  - diagnostics summary/log text stays lazy while hidden
+  - display layout and hit-shape geometry are cached per frame/quote combination
+  - the poll loop now backs off slightly when no live `codex.exe app-server` is present
+- Compile passed after the reasoning-probe change.
+- The companion was relaunched successfully after the change.
+- The most recent validation pass used `codex_ascii_companion.pyw --debug`.
+- Compile passed after the optimization pass too.
+- Live companion after restoring the normal launch: `pythonw.exe` pid 30192 running `codex_ascii_companion.pyw`.
+
+Immediate next move:
+- Keep diagnostics available and watch for a naturally occurring misfire, sticky read, or missed reasoning hit.
+- Pay special attention to quick active-thread switches in the Codex app, since the rollout-path reuse window is now intentionally short.
+- Also watch for an awkwardly slow pickup after launching Codex from a true no-app-server idle state, since idle polling now backs off slightly.
+- If no new sensing problem shows up quickly, move to display-contract cleanup instead of reworking the evidence model again.
+- Only tune the timing windows if a fresh live read actually demands it.
+
+Guardrails:
+- Keep the reasoning check tail-based and light. No heavy continuous logger.
+- Do not merge tool/build detection into reasoning detection.
+- Do not widen into packaging or native migration until the reasoning path is trusted.
+- Preserve the existing dirty docs unless the user explicitly asks to clean or sync them.
+
+Useful commands:
+- `python -m py_compile C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion\codex_ascii_companion.pyw`
+- `powershell -ExecutionPolicy Bypass -File C:\Users\raymo_w9whwcn\OneDrive\TT\codex_ascii_companion\relaunch_companion.ps1`

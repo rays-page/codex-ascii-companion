@@ -43,25 +43,32 @@ For a clean restart:
 
 The pod derives its state from observable Codex runtime signals:
 
-- `thinking`: `codex.exe app-server` itself is active but there is no stronger tool/process signal
-- `tooling`: real descendant processes are active under the Codex app-server tree
-- `building`: descendant commands look like compile/bundle/build work
-- `waiting`: descendant processes still exist but have gone quiet long enough to read as waiting
+- `thinking`: only in root-work cases with no stronger child-path evidence; it prefers a fresh rollout reasoning hit and otherwise falls back to sustained `codex.exe app-server` CPU
+- `tooling`: descendant activity must look meaningful, not just like shell presence; live child-path evidence keeps `thinking` suppressed
+- `building`: descendant commands must look compile/bundle/build-like and actually be active
+- `waiting`: descendant processes still exist, but only after earlier meaningful work has gone quiet
 - `delivered`: short handoff glow after visible work settles
-- `idle`: `standing by`
+- `idle`: the default whenever signals are weak or ambiguous
 
 ## Diagnostics
 
 Diagnostics are optional and live outside the main companion so the desktop presence stays clean. The diagnostics window shows:
 
 - current derived state
+- strongest candidate state when it lost the confidence gate
 - activity hint
 - reasoning string
+- rollout reasoning hit or miss, age, and source
 - last active process source
 - poll generation / inflight generation
 - root CPU delta
-- descendant counts
+- descendant counts broken into meaningful, shell, build, and quiet buckets
+- rolling sensor trace with recent polls, chosen/candidate state, and rejected reasons
 - last error
+
+Live validation on 2026-04-20 confirmed the diagnostics surface can show a real rollout-backed `thinking` transition, clear back out after the answer lands, and still suppress `thinking` when a live child tool path is present.
+When diagnostics are hidden, the companion now skips rebuilding the diagnostics text until that window is shown again.
+When no live `codex.exe app-server` is present, the poll loop now backs off slightly to reduce idle overhead.
 
 ## Notes
 

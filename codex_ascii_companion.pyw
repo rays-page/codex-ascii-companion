@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import ctypes
 import json
@@ -18,6 +19,7 @@ import tkinter.font as tkfont
 
 SPI_GETWORKAREA = 0x0030
 POLL_MS = 550
+IDLE_POLL_MS = 900
 FRAME_MS = 220
 BOOT_SECONDS = 1.6
 PING_SECONDS = 1.2
@@ -28,9 +30,15 @@ ERROR_HOLD_SECONDS = 6.0
 NEW_PROCESS_BONUS = 0.06
 ACTIVE_CPU_THRESHOLD = 0.015
 ROOT_THINKING_CPU_THRESHOLD = 0.05
-ROOT_THINKING_MIN_STREAK = 2
+ROOT_THINKING_MIN_STREAK = 3
 SETTINGS_FILENAME = "companion_settings.json"
 DEBUG_LOG_LIMIT = 16
+TRACE_LOG_LIMIT = 6
+REASONING_SIGNAL_TAIL_BYTES = 262144
+REASONING_SIGNAL_CHECK_INTERVAL = 0.9
+REASONING_SIGNAL_HOLD_SECONDS = 8.0
+REASONING_SIGNAL_FRESH_SECONDS = 20.0
+ROLLOUT_PATH_REUSE_SECONDS = 2.0
 TRANSPARENT_KEY = "#010203"
 HIT_PAD_X = 3
 HIT_PAD_Y = 2
@@ -103,6 +111,12 @@ HINT_ALIASES = {
     "pythonw": "python",
 }
 ACTIVE_VISUAL_STATES = {"thinking", "tooling", "building", "waiting"}
+STATE_CONFIDENCE_GATES = {
+    "building": 0.74,
+    "tooling": 0.68,
+    "waiting": 0.62,
+    "thinking": 0.78,
+}
 STATE_QUOTES = {
     "boot": "syncing",
     "idle": "standing by",
@@ -141,6 +155,16 @@ STATE_QUOTE_COLORS = {
     "paused": "#8c928d",
     "error": "#d18a81",
 }
+PROCESS_SNAPSHOT_COMMAND = (
+    "$cpuById = @{}; "
+    "Get-Process | ForEach-Object { "
+    "$cpuById[[int]$_.Id] = if ($null -eq $_.CPU) { 0.0 } else { [double]$_.CPU } "
+    "}; "
+    "$items = @(Get-CimInstance Win32_Process | Select-Object "
+    "ProcessId, ParentProcessId, Name, CommandLine, "
+    "@{Name='CPU';Expression={ if ($cpuById.ContainsKey([int]$_.ProcessId)) { $cpuById[[int]$_.ProcessId] } else { 0.0 } }}); "
+    "if ($items.Count -eq 0) { '[]' } else { $items | ConvertTo-Json -Compress }"
+)
 
 
 def frame(*lines: str) -> str:
@@ -325,6 +349,16 @@ class ActivitySnapshot:
     descendants: int = 0
     hot_descendants: int = 0
     new_descendants: int = 0
+    meaningful_descendants: int = 0
+    quiet_descendants: int = 0
+    shell_descendants: int = 0
+    specific_shell_descendants: int = 0
+    build_descendants: int = 0
+    active_build_descendants: int = 0
+    reasoning_hit: bool = False
+    reasoning_age: float = 999.0
+    reasoning_source: str = ""
+    reasoning_detail: str = ""
     root_pid: int | None = None
     root_cpu_delta: float = 0.0
     hint: str = ""
@@ -333,6 +367,49 @@ class ActivitySnapshot:
     source_name: str = ""
     source_command: str = ""
     reason: str = "quiet"
+
+
+@dataclass(slots=True)
+class ReasoningProbeResult:
+    active: bool = False
+    age_seconds: float = 999.0
+    source: str = ""
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class RolloutScanState:
+    path: Path | None = None
+    offset: int = 0
+    pending_fragment: str = ""
+    latest_task_started: float = 0.0
+    latest_reasoning: float = 0.0
+    latest_assistant: float = 0.0
+
+
+@dataclass(slots=True)
+class SensorDecision:
+    chosen_state: str
+    candidate_state: str
+    candidate_score: float
+    hint: str
+    reason: str
+    rejected: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class SensorTraceEntry:
+    chosen_state: str
+    candidate_state: str
+    root_cpu_delta: float
+    descendants: int
+    meaningful_descendants: int
+    build_descendants: int
+    reasoning_hit: bool
+    reasoning_age: float
+    hint: str
+    source: str
+    rejected: tuple[str, ...] = ()
 
 
 def windows_work_area() -> tuple[int, int, int, int] | None:
@@ -511,6 +588,7 @@ class CompanionApp:
         self.docked = bool(self._window_settings().get("docked", True))
         self.debug_visible = bool(self.settings.get("debug", False) or self.cli_debug_requested)
         self._start_time = time.monotonic()
+        self.codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
         self.last_snapshot: dict[int, ProcessSample] = {}
         self.self_pid = os.getpid()
         self.poll_generation = 0
@@ -531,7 +609,12 @@ class CompanionApp:
         self.root_pid: int | None = None
         self.root_cpu_delta = 0.0
         self.last_sample = ActivitySnapshot(reason="booting")
+        self.live_rollout_path: Path | None = None
+        self.last_reasoning_probe_at = 0.0
+        self.last_reasoning_probe = ReasoningProbeResult(detail="not checked")
+        self.rollout_scan_state = RolloutScanState()
         self.debug_messages: deque[str] = deque(maxlen=DEBUG_LOG_LIMIT)
+        self.sensor_traces: deque[SensorTraceEntry] = deque(maxlen=TRACE_LOG_LIMIT)
         self.hit_rects: list[tuple[int, int, int, int]] = []
         self._wndproc = None
         self._old_wndproc = None
@@ -541,6 +624,12 @@ class CompanionApp:
         self.debug_summary_var = tk.StringVar(master=self.root, value="")
         self.debug_log_var = tk.StringVar(master=self.root, value="")
         self.debug_window: tk.Toplevel | None = None
+        self.debug_summary_cache = ""
+        self.debug_log_cache = ""
+        self.display_layout_cache: dict[
+            tuple[str, str, str],
+            tuple[int, int, int, int, int, tuple[tuple[int, int, int, int], ...]],
+        ] = {}
 
         self._build_ui()
         self._bind_events()
@@ -762,6 +851,12 @@ class CompanionApp:
         self.menu.entryconfigure(self.pause_menu_index, label="Resume Sensing" if self.paused else "Pause Sensing")
         self.menu.entryconfigure(self.debug_menu_index, label="Hide Diagnostics" if self.debug_visible else "Show Diagnostics")
 
+    def _reset_reasoning_probe_state(self, detail: str) -> None:
+        self.live_rollout_path = None
+        self.last_reasoning_probe_at = 0.0
+        self.last_reasoning_probe = ReasoningProbeResult(detail=detail)
+        self.rollout_scan_state = RolloutScanState()
+
     def _dock_above_clock(self, *, save: bool = True) -> None:
         self.root.update_idletasks()
         width = self.root.winfo_reqwidth()
@@ -795,6 +890,8 @@ class CompanionApp:
         self.root_cpu_delta = 0.0
         self.last_sample = ActivitySnapshot(reason="paused")
         self.last_active_source = ""
+        self._reset_reasoning_probe_state("paused")
+        self.sensor_traces.clear()
         self.poll_generation += 1
         self.inflight_generation = None
         if self.paused:
@@ -821,7 +918,7 @@ class CompanionApp:
     def _ensure_debug_window(self) -> None:
         if self.debug_window is not None and self.debug_window.winfo_exists():
             self._place_debug_window()
-            self._refresh_debug_view()
+            self._refresh_debug_view(force=True)
             return
 
         self.debug_window = tk.Toplevel(self.root)
@@ -865,7 +962,7 @@ class CompanionApp:
 
         self.debug_window.protocol("WM_DELETE_WINDOW", self._hide_debug_window)
         self._place_debug_window()
-        self._refresh_debug_view()
+        self._refresh_debug_view(force=True)
 
     def _hide_debug_window(self) -> None:
         self.debug_visible = False
@@ -897,7 +994,18 @@ class CompanionApp:
             return "-"
         return f"{max(time.monotonic() - timestamp, 0.0):.1f}s"
 
-    def _refresh_debug_view(self) -> None:
+    def _reasoning_debug_text(self, sample: ActivitySnapshot) -> str:
+        if sample.reasoning_hit:
+            source = sample.reasoning_source or "rollout"
+            return f"{source} {sample.reasoning_age:.1f}s ago"
+        if sample.reasoning_detail:
+            return sample.reasoning_detail
+        return "-"
+
+    def _refresh_debug_view(self, *, force: bool = False) -> None:
+        window_live = self.debug_window is not None and self.debug_window.winfo_exists()
+        if not force and (not self.debug_visible or not window_live):
+            return
         summary_lines = [
             f"state      {self._current_state()}",
             f"hint       {self.activity_hint or '-'}",
@@ -906,18 +1014,79 @@ class CompanionApp:
             f"poll gen   {self.poll_generation} / {self.inflight_generation if self.inflight_generation is not None else '-'}",
             f"root cpu   {self.root_cpu_delta:.3f} (pid {self.root_pid or '-'})",
             f"root gate  {self.root_activity_streak}/{ROOT_THINKING_MIN_STREAK} over {ROOT_THINKING_CPU_THRESHOLD:.3f}",
-            f"desc       {self.last_sample.descendants} total, {self.last_sample.hot_descendants} hot, {self.last_sample.new_descendants} new",
-            f"kind       {self.last_sample.phase_kind}",
+            (
+                f"desc       {self.last_sample.descendants} total, "
+                f"{self.last_sample.meaningful_descendants} meaningful, "
+                f"{self.last_sample.hot_descendants} hot, {self.last_sample.new_descendants} new"
+            ),
+            (
+                f"class      {self.last_sample.shell_descendants} shell, "
+                f"{self.last_sample.build_descendants} build, "
+                f"{self.last_sample.quiet_descendants} quiet"
+            ),
+            f"kind       {self.last_sample.phase_kind or '-'}",
+            (
+                f"reasoning  {'hit' if self.last_sample.reasoning_hit else 'miss'} "
+                f"{self._reasoning_debug_text(self.last_sample)}"
+            ),
             f"last poll  {self._age_text(self.last_successful_poll_at)} ago",
             f"error      {self.last_error_text or '-'}",
         ]
-        self.debug_summary_var.set("\n".join(summary_lines))
-        self.debug_log_var.set("\n".join(self.debug_messages) if self.debug_messages else "no events yet")
+        summary_text = "\n".join(summary_lines)
+        trace_lines = self._sensor_trace_lines()
+        event_lines = list(self.debug_messages)[-6:]
+        blocks: list[str] = []
+        if trace_lines:
+            blocks.extend(["sensor trace", *trace_lines])
+        if event_lines:
+            if blocks:
+                blocks.append("")
+            blocks.extend(["events", *event_lines])
+        log_text = "\n".join(blocks) if blocks else "no diagnostics yet"
+        if summary_text != self.debug_summary_cache:
+            self.debug_summary_cache = summary_text
+            self.debug_summary_var.set(summary_text)
+        if log_text != self.debug_log_cache:
+            self.debug_log_cache = log_text
+            self.debug_log_var.set(log_text)
 
     def _log_debug(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         self.debug_messages.append(f"{timestamp} {message}")
         self._refresh_debug_view()
+
+    def _sensor_trace_lines(self) -> list[str]:
+        lines: list[str] = []
+        for entry in self.sensor_traces:
+            signal = entry.source or entry.hint or "-"
+            reasoning = f"yes@{entry.reasoning_age:.1f}s" if entry.reasoning_hit else "no"
+            lines.append(
+                (
+                    f"{entry.chosen_state:<9} cand {entry.candidate_state:<8} "
+                    f"root {entry.root_cpu_delta:.3f} desc {entry.meaningful_descendants}/{entry.descendants} "
+                    f"build {entry.build_descendants} think {reasoning:<8} sig {signal}"
+                )
+            )
+            if entry.rejected:
+                lines.append(f"  no       {' | '.join(entry.rejected[:3])}")
+        return lines
+
+    def _record_sensor_trace(self, sample: ActivitySnapshot, decision: SensorDecision) -> None:
+        self.sensor_traces.appendleft(
+            SensorTraceEntry(
+                chosen_state=decision.chosen_state,
+                candidate_state=decision.candidate_state,
+                root_cpu_delta=sample.root_cpu_delta,
+                descendants=sample.descendants,
+                meaningful_descendants=sample.meaningful_descendants,
+                build_descendants=sample.build_descendants,
+                reasoning_hit=sample.reasoning_hit,
+                reasoning_age=sample.reasoning_age,
+                hint=sample.hint,
+                source=self._format_source(sample) if sample.source_name else "",
+                rejected=decision.rejected,
+            )
+        )
 
     def _quit(self) -> None:
         self._save_settings()
@@ -931,8 +1100,10 @@ class CompanionApp:
             return "error"
         if now < self.nudge_until:
             return "ping"
-        if self.visual_state == "boot" and now < self.start_time + BOOT_SECONDS:
-            return "boot"
+        if self.visual_state == "boot":
+            if now < self.start_time + BOOT_SECONDS:
+                return "boot"
+            return "idle"
         return self.visual_state
 
     def _frames_for_state(self, state: str) -> tuple[str, ...]:
@@ -967,10 +1138,8 @@ class CompanionApp:
             return self._tooling_quote()
         if state == "building":
             return self._building_quote()
-        if state == "thinking":
-            return STATE_QUOTES["thinking"]
-        if state == "waiting":
-            return STATE_QUOTES["waiting"]
+        if state in {"thinking", "waiting"}:
+            return ""
         return STATE_QUOTES.get(state, "")
 
     def _tooling_quote(self) -> str:
@@ -1051,7 +1220,7 @@ class CompanionApp:
         finally:
             self._old_wndproc = None
 
-    def _update_hit_shape(self, art: str, quote: str, art_x: int, quote_x: int, quote_y: int) -> None:
+    def _compute_hit_rects(self, art: str, quote: str, art_x: int, quote_x: int, quote_y: int) -> tuple[tuple[int, int, int, int], ...]:
         rects: list[tuple[int, int, int, int]] = []
         region_specs = (
             (art.splitlines() or [""], self.art_font, art_x, 2),
@@ -1073,19 +1242,26 @@ class CompanionApp:
                         top + line_height + HIT_PAD_Y + 3,
                     )
                 )
-        self.hit_rects = rects
+        return tuple(rects)
 
     def _set_display(self, state: str, art: str) -> None:
-        art_width, art_height = self._measure_text(art, self.art_font)
         quote = self._quote_for_state(state)
-        quote_width, quote_height = self._measure_text(quote, self.quote_font) if quote else (0, 0)
-        content_width = max(art_width, quote_width)
-        content_height = art_height + (quote_height + 4 if quote else 0)
         pad_x = 2
         pad_y = 2
-        art_x = pad_x + (content_width - art_width) // 2
-        quote_x = pad_x + (content_width - quote_width) // 2 if quote else pad_x
-        quote_y = pad_y + art_height + 3
+        layout_key = (state, art, quote)
+        layout = self.display_layout_cache.get(layout_key)
+        if layout is None:
+            art_width, art_height = self._measure_text(art, self.art_font)
+            quote_width, quote_height = self._measure_text(quote, self.quote_font) if quote else (0, 0)
+            content_width = max(art_width, quote_width)
+            content_height = art_height + (quote_height + 4 if quote else 0)
+            art_x = pad_x + (content_width - art_width) // 2
+            quote_x = pad_x + (content_width - quote_width) // 2 if quote else pad_x
+            quote_y = pad_y + art_height + 3
+            hit_rects = self._compute_hit_rects(art, quote, art_x, quote_x, quote_y)
+            layout = (content_width, content_height, art_x, quote_x, quote_y, hit_rects)
+            self.display_layout_cache[layout_key] = layout
+        content_width, content_height, art_x, quote_x, quote_y, hit_rects = layout
         self.canvas.configure(width=content_width + 4, height=content_height + 4)
         self.canvas.itemconfigure(self.shadow_far_item, text="")
         self.canvas.itemconfigure(self.shadow_near_item, text=art, fill=ART_SHADOW_COLOR)
@@ -1097,7 +1273,7 @@ class CompanionApp:
         self.canvas.itemconfigure(self.quote_item, text=quote, fill=STATE_QUOTE_COLORS[state])
         self.canvas.coords(self.quote_shadow_item, quote_x + 1, quote_y + 1)
         self.canvas.coords(self.quote_item, quote_x, quote_y)
-        self._update_hit_shape(art, quote, art_x, quote_x, quote_y)
+        self.hit_rects = list(hit_rects)
 
     def _animate(self) -> None:
         state = self._current_state()
@@ -1122,19 +1298,9 @@ class CompanionApp:
         worker.start()
 
     def _poll_processes(self, generation: int) -> None:
-        command = (
-            "$cpuById = @{}; "
-            "Get-Process | ForEach-Object { "
-            "$cpuById[[int]$_.Id] = if ($null -eq $_.CPU) { 0.0 } else { [double]$_.CPU } "
-            "}; "
-            "$items = @(Get-CimInstance Win32_Process | Select-Object "
-            "ProcessId, ParentProcessId, Name, CommandLine, "
-            "@{Name='CPU';Expression={ if ($cpuById.ContainsKey([int]$_.ProcessId)) { $cpuById[[int]$_.ProcessId] } else { 0.0 } }}); "
-            "if ($items.Count -eq 0) { '[]' } else { $items | ConvertTo-Json -Compress }"
-        )
         try:
             completed = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
+                ["powershell", "-NoProfile", "-Command", PROCESS_SNAPSHOT_COMMAND],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -1151,6 +1317,15 @@ class CompanionApp:
             error_text = str(exc)
         self.root.after(0, lambda: self._apply_poll_result(generation, activity, error_text))
 
+    def _next_poll_delay_ms(self, sample: ActivitySnapshot | None, error_text: str) -> int:
+        if error_text:
+            return POLL_MS
+        if sample is None:
+            return POLL_MS
+        if sample.root_pid or sample.descendants or sample.reasoning_hit:
+            return POLL_MS
+        return IDLE_POLL_MS
+
     def _normalize_snapshot(self, payload: str) -> list[dict[str, object]]:
         if not payload:
             return []
@@ -1160,6 +1335,185 @@ class CompanionApp:
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
         return []
+
+    def _parse_event_timestamp(self, raw: object) -> float:
+        if not isinstance(raw, str) or not raw:
+            return 0.0
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _locate_live_rollout_path(self, now_epoch: float) -> Path | None:
+        if self.live_rollout_path is not None:
+            try:
+                modified = self.live_rollout_path.stat().st_mtime
+            except OSError:
+                self.live_rollout_path = None
+            else:
+                if now_epoch - modified <= ROLLOUT_PATH_REUSE_SECONDS:
+                    return self.live_rollout_path
+        sessions_root = self.codex_home / "sessions"
+        best_path: Path | None = None
+        best_mtime = 0.0
+        for day_offset in (0, 1):
+            day = time.localtime(now_epoch - (day_offset * 86400))
+            day_dir = sessions_root / f"{day.tm_year:04d}" / f"{day.tm_mon:02d}" / f"{day.tm_mday:02d}"
+            if not day_dir.exists():
+                continue
+            try:
+                for child in day_dir.iterdir():
+                    if child.suffix != ".jsonl" or not child.is_file():
+                        continue
+                    try:
+                        modified = child.stat().st_mtime
+                    except OSError:
+                        continue
+                    if modified > best_mtime and now_epoch - modified <= REASONING_SIGNAL_FRESH_SECONDS:
+                        best_mtime = modified
+                        best_path = child
+            except OSError:
+                continue
+        self.live_rollout_path = best_path
+        return best_path
+
+    def _read_rollout_lines(self, path: Path) -> list[str] | None:
+        state = self.rollout_scan_state
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+
+        reset_scan = state.path != path or size < state.offset
+        start = max(size - REASONING_SIGNAL_TAIL_BYTES, 0) if reset_scan else state.offset
+        try:
+            with path.open("rb") as handle:
+                prefix = b""
+                if reset_scan and start > 0:
+                    handle.seek(start - 1)
+                    prefix = handle.read(1)
+                handle.seek(start)
+                chunk = handle.read()
+        except OSError:
+            return None
+
+        text = chunk.decode("utf-8", errors="ignore")
+        if reset_scan:
+            state = RolloutScanState(path=path, offset=size)
+            if start > 0 and prefix not in {b"\n", b"\r"}:
+                newline_index = text.find("\n")
+                if newline_index == -1:
+                    self.rollout_scan_state = state
+                    return []
+                text = text[newline_index + 1 :]
+        else:
+            state.offset = size
+            if state.pending_fragment:
+                text = state.pending_fragment + text
+                state.pending_fragment = ""
+
+        lines = text.splitlines()
+        if text and not text.endswith(("\n", "\r")):
+            state.pending_fragment = lines.pop() if lines else text
+        else:
+            state.pending_fragment = ""
+
+        self.rollout_scan_state = state
+        return lines
+
+    def _rollout_probe_timestamps(self, path: Path) -> tuple[float, float, float] | None:
+        lines = self._read_rollout_lines(path)
+        if lines is None:
+            return None
+
+        state = self.rollout_scan_state
+        for line in lines:
+            if '"timestamp"' not in line:
+                continue
+            if (
+                '"task_started"' not in line
+                and '"payload":{"type":"reasoning"' not in line
+                and '"role":"assistant"' not in line
+            ):
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            timestamp = self._parse_event_timestamp(item.get("timestamp"))
+            if timestamp <= 0.0:
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if item.get("type") == "event_msg" and payload.get("type") == "task_started":
+                state.latest_task_started = max(state.latest_task_started, timestamp)
+                continue
+            if item.get("type") != "response_item":
+                continue
+            if payload.get("type") == "reasoning":
+                state.latest_reasoning = max(state.latest_reasoning, timestamp)
+                continue
+            if payload.get("type") == "message" and payload.get("role") == "assistant":
+                state.latest_assistant = max(state.latest_assistant, timestamp)
+
+        return state.latest_task_started, state.latest_reasoning, state.latest_assistant
+
+    def _scan_reasoning_probe(self) -> ReasoningProbeResult:
+        now = time.monotonic()
+        if now - self.last_reasoning_probe_at < REASONING_SIGNAL_CHECK_INTERVAL:
+            return self.last_reasoning_probe
+        self.last_reasoning_probe_at = now
+
+        now_epoch = time.time()
+        rollout_path = self._locate_live_rollout_path(now_epoch)
+        if rollout_path is None:
+            self.last_reasoning_probe = ReasoningProbeResult(detail="no live rollout")
+            return self.last_reasoning_probe
+
+        timestamps = self._rollout_probe_timestamps(rollout_path)
+        if timestamps is None:
+            self.last_reasoning_probe = ReasoningProbeResult(source=rollout_path.name, detail="rollout unreadable")
+            return self.last_reasoning_probe
+
+        latest_task_started, latest_reasoning, latest_assistant = timestamps
+
+        age_seconds = max(now_epoch - latest_reasoning, 0.0) if latest_reasoning else 999.0
+        if (
+            latest_reasoning
+            and latest_reasoning >= latest_task_started
+            and latest_assistant < latest_reasoning
+            and age_seconds <= REASONING_SIGNAL_HOLD_SECONDS
+        ):
+            result = ReasoningProbeResult(
+                active=True,
+                age_seconds=age_seconds,
+                source=rollout_path.name,
+                detail=f"rollout reasoning {age_seconds:.1f}s ago",
+            )
+        elif latest_reasoning and latest_assistant >= latest_reasoning:
+            result = ReasoningProbeResult(
+                age_seconds=age_seconds,
+                source=rollout_path.name,
+                detail="rollout already answered",
+            )
+        elif latest_reasoning and latest_reasoning < latest_task_started:
+            result = ReasoningProbeResult(
+                age_seconds=age_seconds,
+                source=rollout_path.name,
+                detail="reasoning from earlier turn",
+            )
+        elif latest_reasoning:
+            result = ReasoningProbeResult(
+                age_seconds=age_seconds,
+                source=rollout_path.name,
+                detail=f"rollout reasoning stale {age_seconds:.1f}s",
+            )
+        else:
+            result = ReasoningProbeResult(source=rollout_path.name, detail="no rollout reasoning hit")
+
+        self.last_reasoning_probe = result
+        return result
 
     def _process_stem(self, name: str) -> str:
         return HINT_ALIASES.get(Path(name).stem.lower(), Path(name).stem.lower())
@@ -1236,9 +1590,9 @@ class CompanionApp:
                 root_pid = pid
 
         seen: set[int] = set()
-        queue = list(roots)
+        queue = deque(roots)
         while queue:
-            current_pid = queue.pop(0)
+            current_pid = queue.popleft()
             if current_pid in seen:
                 continue
             seen.add(current_pid)
@@ -1247,7 +1601,12 @@ class CompanionApp:
         descendants = 0
         hot_descendants = 0
         new_descendants = 0
+        meaningful_descendants = 0
+        quiet_descendants = 0
+        shell_descendants = 0
+        specific_shell_descendants = 0
         build_descendants = 0
+        active_build_descendants = 0
         best_score = -1.0
         best_hint = ""
         best_kind = "-"
@@ -1267,24 +1626,38 @@ class CompanionApp:
             descendants += 1
             hint = self._hint_from_process(stem, current.command_line)
             kind = self._classify_process_kind(stem, current.command_line, hint)
+            is_shell = stem in SHELL_STEMS
+            if is_shell:
+                shell_descendants += 1
+                if hint != stem:
+                    specific_shell_descendants += 1
             if kind == "build":
                 build_descendants += 1
             previous = self.last_snapshot.get(pid)
             cpu_delta = max(current.cpu - previous.cpu, 0.0) if previous is not None else 0.0
             is_new = previous is None
-            is_hot = is_new or cpu_delta >= ACTIVE_CPU_THRESHOLD
+            is_hot = cpu_delta >= ACTIVE_CPU_THRESHOLD
+            meaningful = is_hot or (is_new and (kind == "build" or hint != stem or not is_shell))
             if is_new:
                 new_descendants += 1
             if is_hot:
                 hot_descendants += 1
+            if meaningful:
+                meaningful_descendants += 1
+                if kind == "build":
+                    active_build_descendants += 1
+            else:
+                quiet_descendants += 1
 
             score = cpu_delta
-            if is_new:
+            if meaningful and is_new:
                 score += NEW_PROCESS_BONUS
-            if kind == "build":
+            if meaningful and kind == "build":
                 score += 0.02
-            if stem in SHELL_STEMS and hint != stem:
+            if is_shell and hint != stem:
                 score += 0.01
+            if not meaningful:
+                score -= 0.02
 
             if score > best_score:
                 best_score = score
@@ -1293,10 +1666,12 @@ class CompanionApp:
                 best_name = current.name
                 best_command = current.command_line
                 best_pid = pid
-                if is_new:
+                if meaningful and is_new:
                     best_reason = f"new {current.name}"
-                elif cpu_delta > 0.0:
+                elif is_hot:
                     best_reason = f"{current.name} cpu +{cpu_delta:.3f}"
+                elif is_shell and hint == stem:
+                    best_reason = f"quiet {current.name}"
                 else:
                     best_reason = f"{current.name} present"
 
@@ -1306,11 +1681,37 @@ class CompanionApp:
             best_reason = f"app-server cpu +{root_cpu_delta:.3f}"
         elif descendants == 0 and not roots:
             best_reason = "no app-server"
+        elif descendants and meaningful_descendants == 0:
+            if shell_descendants == descendants:
+                best_reason = "shell presence only"
+            else:
+                best_reason = "quiet descendants only"
+
+        reasoning = ReasoningProbeResult(detail="child path present" if descendants else "root quiet")
+        should_probe_reasoning = (
+            not descendants
+            and bool(roots)
+            and (root_cpu_delta > 0.0 or self.root_activity_streak > 0 or self.last_reasoning_probe.active)
+        )
+        if should_probe_reasoning:
+            reasoning = self._scan_reasoning_probe()
+        elif not roots:
+            reasoning = ReasoningProbeResult(detail="no app-server")
 
         return ActivitySnapshot(
             descendants=descendants,
             hot_descendants=hot_descendants,
             new_descendants=new_descendants,
+            meaningful_descendants=meaningful_descendants,
+            quiet_descendants=quiet_descendants,
+            shell_descendants=shell_descendants,
+            specific_shell_descendants=specific_shell_descendants,
+            build_descendants=build_descendants,
+            active_build_descendants=active_build_descendants,
+            reasoning_hit=reasoning.active,
+            reasoning_age=reasoning.age_seconds,
+            reasoning_source=reasoning.source,
+            reasoning_detail=reasoning.detail,
             root_pid=root_pid,
             root_cpu_delta=root_cpu_delta,
             hint=best_hint,
@@ -1329,63 +1730,125 @@ class CompanionApp:
             return f"{sample.source_name} [{sample.hint}]"
         return sample.source_name
 
-    def _derive_state(self, sample: ActivitySnapshot, now: float) -> tuple[str, str, str]:
+    def _derive_state(self, sample: ActivitySnapshot, now: float) -> SensorDecision:
         root_hot = sample.root_cpu_delta >= ROOT_THINKING_CPU_THRESHOLD
 
-        if sample.descendants:
+        if sample.meaningful_descendants:
             self.root_activity_streak = 0
-        elif root_hot:
+            self.last_descendant_seen_at = now
+            self.last_tool_activity_at = now
+        else:
+            if sample.descendants:
+                self.last_descendant_seen_at = now
+        if not sample.descendants and root_hot:
             self.last_root_activity_at = now
-            self.root_activity_streak = min(self.root_activity_streak + 1, ROOT_THINKING_MIN_STREAK + 2)
+            self.root_activity_streak = min(self.root_activity_streak + 1, ROOT_THINKING_MIN_STREAK + 3)
         elif now - self.last_root_activity_at >= THINKING_HOLD_SECONDS:
             self.root_activity_streak = 0
 
-        if sample.descendants:
-            self.last_descendant_seen_at = now
-            if self.last_tool_activity_at <= 0.0:
-                self.last_tool_activity_at = now
-        if sample.hot_descendants or sample.new_descendants:
-            self.last_tool_activity_at = now
         if sample.source_name:
             self.last_active_source = self._format_source(sample)
 
         quiet_for = now - self.last_tool_activity_at if self.last_tool_activity_at > 0.0 else 999.0
-        root_recent = (
-            not sample.descendants
-            and self.root_activity_streak >= ROOT_THINKING_MIN_STREAK
-            and now - self.last_root_activity_at < THINKING_HOLD_SECONDS
-        )
         had_active_visual = self.visual_state in ACTIVE_VISUAL_STATES
-        state = "idle"
-        hint = sample.hint
-        reason = sample.reason
+        scores: dict[str, float] = {}
+        reasons: dict[str, str] = {}
+        rejected: list[str] = []
 
-        if sample.descendants:
-            if sample.phase_kind == "build" and quiet_for < WAITING_GRACE_SECONDS:
-                state = "building"
-            elif sample.hot_descendants or sample.new_descendants:
-                state = "tooling"
-            elif quiet_for >= WAITING_GRACE_SECONDS:
-                state = "waiting"
+        if sample.active_build_descendants:
+            build_score = 0.82 + min(sample.active_build_descendants, 2) * 0.06
+            if sample.hot_descendants:
+                build_score += 0.05
+            scores["building"] = min(build_score, 0.97)
+            reasons["building"] = sample.reason or "build activity detected"
+        elif sample.build_descendants:
+            rejected.append("building quiet only")
+
+        if sample.meaningful_descendants:
+            tooling_score = 0.66 + min(sample.meaningful_descendants, 2) * 0.07
+            if sample.hot_descendants:
+                tooling_score += 0.07
+            if sample.specific_shell_descendants:
+                tooling_score += 0.03
+            scores["tooling"] = min(tooling_score, 0.95)
+            reasons["tooling"] = sample.reason or "child tool path active"
+        elif sample.descendants:
+            if sample.shell_descendants == sample.descendants:
+                rejected.append("tooling held: shell-only")
             else:
-                state = "tooling"
-        elif root_recent:
-            state = "thinking"
-            hint = ""
-            reason = f"sustained app-server cpu ({self.root_activity_streak} polls)"
+                rejected.append("tooling held: descendants quiet")
 
-        if state in ACTIVE_VISUAL_STATES:
+        if sample.descendants and not sample.meaningful_descendants:
+            if self.last_tool_activity_at > 0.0 and quiet_for >= WAITING_GRACE_SECONDS:
+                waiting_score = 0.70
+                if sample.shell_descendants != sample.descendants:
+                    waiting_score += 0.04
+                scores["waiting"] = min(waiting_score, 0.90)
+                reasons["waiting"] = f"work quiet for {quiet_for:.1f}s"
+            elif self.last_tool_activity_at <= 0.0:
+                rejected.append("waiting held: no prior work")
+            else:
+                rejected.append(f"waiting held: quiet {quiet_for:.1f}s")
+
+        if not sample.descendants and sample.reasoning_hit:
+            thinking_score = 0.84
+            if root_hot:
+                thinking_score += 0.05
+            elif self.root_activity_streak:
+                thinking_score += 0.03
+            thinking_score += min(sample.root_cpu_delta, 0.12) * 0.25
+            scores["thinking"] = min(thinking_score, 0.98)
+            reasons["thinking"] = f"rollout reasoning hit {sample.reasoning_age:.1f}s ago"
+        elif not sample.descendants and root_hot:
+            thinking_score = 0.44 + min(self.root_activity_streak, ROOT_THINKING_MIN_STREAK + 2) * 0.12
+            thinking_score += min(sample.root_cpu_delta, 0.18) * 0.70
+            scores["thinking"] = min(thinking_score, 0.96)
+            reasons["thinking"] = f"app-server cpu +{sample.root_cpu_delta:.3f} for {self.root_activity_streak} polls"
+        elif sample.descendants:
+            rejected.append("thinking held: child path present")
+        elif sample.root_cpu_delta > 0.0:
+            rejected.append("thinking held: root pulse light")
+        elif sample.reasoning_detail:
+            rejected.append(f"thinking held: {sample.reasoning_detail}")
+
+        idle_reason = sample.reason or "quiet"
+        if sample.descendants and not sample.meaningful_descendants:
+            idle_reason = "signals weak; staying quiet"
+        elif sample.root_cpu_delta > 0.0 and not sample.descendants:
+            idle_reason = "root pulse below confidence gate"
+        elif not sample.root_pid:
+            idle_reason = "no app-server"
+        elif sample.reasoning_detail:
+            idle_reason = sample.reasoning_detail
+
+        candidate_state = "idle"
+        candidate_score = 0.0
+        chosen_state = "idle"
+        hint = ""
+        reason = idle_reason
+        if scores:
+            candidate_state, candidate_score = max(scores.items(), key=lambda item: item[1])
+            gate = STATE_CONFIDENCE_GATES[candidate_state]
+            if candidate_score >= gate:
+                chosen_state = candidate_state
+                reason = reasons[candidate_state]
+                if chosen_state in {"building", "tooling"}:
+                    hint = sample.hint
+            else:
+                rejected.insert(0, f"{candidate_state} below gate {candidate_score:.2f}/{gate:.2f}")
+
+        if chosen_state in ACTIVE_VISUAL_STATES:
             self.delivered_until = 0.0
-            return state, hint, reason
+            return SensorDecision(chosen_state, candidate_state, candidate_score, hint, reason, tuple(rejected[:3]))
 
-        if state == "idle" and had_active_visual:
+        if chosen_state == "idle" and had_active_visual:
             self.delivered_until = now + DELIVERED_HOLD_SECONDS
-            return "delivered", "", "recent work finished"
+            return SensorDecision("delivered", candidate_state, candidate_score, "", "recent work finished", tuple(rejected[:3]))
 
-        if state == "idle" and self.delivered_until > now:
-            return "delivered", "", "recent work finished"
+        if chosen_state == "idle" and self.delivered_until > now:
+            return SensorDecision("delivered", candidate_state, candidate_score, "", "recent work finished", tuple(rejected[:3]))
 
-        return "idle", "", reason
+        return SensorDecision("idle", candidate_state, candidate_score, "", reason, tuple(rejected[:3]))
 
     def _set_visual_state(self, state: str, hint: str, reason: str) -> None:
         changed = state != self.visual_state or hint != self.activity_hint
@@ -1426,10 +1889,11 @@ class CompanionApp:
             self.last_error_text = ""
             self.error_until = 0.0
             self.last_successful_poll_at = now
-            state, hint, reason = self._derive_state(sample, now)
-            self._set_visual_state(state, hint, reason)
+            decision = self._derive_state(sample, now)
+            self._record_sensor_trace(sample, decision)
+            self._set_visual_state(decision.chosen_state, decision.hint, decision.reason)
 
-        self.root.after(POLL_MS, self._schedule_poll)
+        self.root.after(self._next_poll_delay_ms(None if error_text else sample, error_text), self._schedule_poll)
 
     def run(self) -> None:
         self.root.mainloop()
