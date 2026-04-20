@@ -15,6 +15,8 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from urllib.parse import quote
+import winreg
 
 
 SPI_GETWORKAREA = 0x0030
@@ -39,6 +41,7 @@ REASONING_SIGNAL_CHECK_INTERVAL = 0.9
 REASONING_SIGNAL_HOLD_SECONDS = 8.0
 REASONING_SIGNAL_FRESH_SECONDS = 20.0
 ROLLOUT_PATH_REUSE_SECONDS = 2.0
+THEME_CHECK_INTERVAL = 2.0
 TRANSPARENT_KEY = "#010203"
 HIT_PAD_X = 3
 HIT_PAD_Y = 2
@@ -129,8 +132,9 @@ STATE_QUOTES = {
     "paused": "sensing off",
     "error": "lost sync",
 }
-ART_SHADOW_COLOR = "#223326"
-QUOTE_SHADOW_COLOR = "#203024"
+WINDOWS_THEME_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+WINDOWS_APPS_THEME_VALUE = "AppsUseLightTheme"
+HOMEBASE_WORKSPACE = Path.home() / "OneDrive" / "Homebase"
 STATE_ART_COLORS = {
     "boot": "#c8e6ff",
     "idle": "#c8ffab",
@@ -155,6 +159,80 @@ STATE_QUOTE_COLORS = {
     "paused": "#8c928d",
     "error": "#d18a81",
 }
+THEME_PALETTES = {
+    "light": {
+        "art_shadow_far": "",
+        "art_shadow_near": "#6f7f76",
+        "quote_shadow": "#90a096",
+        "state_art_colors": STATE_ART_COLORS,
+        "state_quote_colors": STATE_QUOTE_COLORS,
+        "debug_bg": "#f4f2ea",
+        "debug_border": "#b7b09d",
+        "debug_text": "#223127",
+        "debug_muted": "#5a685f",
+        "buddy_bg": "#f6f3eb",
+        "buddy_border": "#bdb39c",
+        "buddy_title": "#243127",
+        "buddy_copy": "#5a665d",
+        "buddy_status": "#35443a",
+        "card_bg": "#fffdf8",
+        "card_hover_bg": "#f0ece1",
+        "card_border": "#d2cab5",
+        "card_title": "#223127",
+        "card_subtitle": "#5d675e",
+    },
+    "dark": {
+        "art_shadow_far": "",
+        "art_shadow_near": "#a7c8af",
+        "quote_shadow": "#9ebb9d",
+        "state_art_colors": STATE_ART_COLORS,
+        "state_quote_colors": {
+            "boot": "#9ab8d0",
+            "idle": "#a7c38e",
+            "thinking": "#a5bfd1",
+            "tooling": "#d6c57e",
+            "building": "#e4b587",
+            "waiting": "#adbbdb",
+            "delivered": "#a6d3a4",
+            "ping": "#d3ab80",
+            "paused": "#a7ada8",
+            "error": "#e19a8e",
+        },
+        "debug_bg": "#0b120d",
+        "debug_border": "#26362a",
+        "debug_text": "#d9ebd4",
+        "debug_muted": "#92a896",
+        "buddy_bg": "#101713",
+        "buddy_border": "#2a3f32",
+        "buddy_title": "#e2f0dc",
+        "buddy_copy": "#8ea393",
+        "buddy_status": "#b7cdb4",
+        "card_bg": "#162019",
+        "card_hover_bg": "#1d2a21",
+        "card_border": "#304536",
+        "card_title": "#eef7eb",
+        "card_subtitle": "#9aaf9c",
+    },
+}
+CLEAN_FILES_PROMPT = """Work in conservative Homebase file-organization mode.
+
+Goal:
+- help me clean up Homebase without breaking anything
+
+Rules:
+- treat this as organization, not aggressive cleanup
+- do not delete or move anything on doubt
+- prefer review staging, exact paths, and rollback-friendly steps
+- start by inspecting Homebase and proposing the safest first pass
+"""
+SAFETY_SCAN_PROMPT = """A Microsoft Defender quick scan has just been requested from the desktop buddy.
+
+Security mode:
+- facts, inferences, and unknowns first
+- use exact timestamps and full paths
+- stay chat-first unless I explicitly approve host actions
+- start by helping me review scan context, recent alerts, and anything suspicious near Homebase
+"""
 PROCESS_SNAPSHOT_COMMAND = (
     "$cpuById = @{}; "
     "Get-Process | ForEach-Object { "
@@ -412,6 +490,15 @@ class SensorTraceEntry:
     rejected: tuple[str, ...] = ()
 
 
+def windows_apps_theme_mode() -> str:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_THEME_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, WINDOWS_APPS_THEME_VALUE)
+    except OSError:
+        return "light"
+    return "light" if int(value) else "dark"
+
+
 def windows_work_area() -> tuple[int, int, int, int] | None:
     try:
         rect = wintypes.RECT()
@@ -560,6 +647,9 @@ class CompanionApp:
         self.cli_debug_requested = "--debug" in sys.argv[1:]
         self.settings_error = ""
         self.settings = self._load_settings()
+        self.theme_mode = windows_apps_theme_mode()
+        self.theme_palette = THEME_PALETTES[self.theme_mode]
+        self.last_theme_check_at = 0.0
 
         self.root = tk.Tk()
         self.root.title("Codex Courier Pod")
@@ -587,6 +677,8 @@ class CompanionApp:
         self.paused = False
         self.docked = bool(self._window_settings().get("docked", True))
         self.debug_visible = bool(self.settings.get("debug", False) or self.cli_debug_requested)
+        self.buddy_visible = bool(self._buddy_settings().get("visible", True))
+        self.text_visible = bool(self._text_settings().get("visible", True))
         self._start_time = time.monotonic()
         self.codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
         self.last_snapshot: dict[int, ProcessSample] = {}
@@ -624,8 +716,20 @@ class CompanionApp:
         self.debug_summary_var = tk.StringVar(master=self.root, value="")
         self.debug_log_var = tk.StringVar(master=self.root, value="")
         self.debug_window: tk.Toplevel | None = None
+        self.debug_summary_label: tk.Label | None = None
+        self.debug_log_label: tk.Label | None = None
+        self.debug_divider: tk.Frame | None = None
         self.debug_summary_cache = ""
         self.debug_log_cache = ""
+        self.buddy_window: tk.Toplevel | None = None
+        self.buddy_body_frame: tk.Frame | None = None
+        self.buddy_state_var = tk.StringVar(master=self.root, value="Pod says syncing.")
+        self.buddy_status_var = tk.StringVar(master=self.root, value="Quiet help nearby.")
+        self.buddy_cards: list[dict[str, object]] = []
+        self.buddy_title_label: tk.Label | None = None
+        self.buddy_copy_label: tk.Label | None = None
+        self.buddy_state_label: tk.Label | None = None
+        self.buddy_status_label: tk.Label | None = None
         self.display_layout_cache: dict[
             tuple[str, str, str],
             tuple[int, int, int, int, int, tuple[tuple[int, int, int, int], ...]],
@@ -635,6 +739,9 @@ class CompanionApp:
         self._bind_events()
         self._install_hit_test_hook()
         self._restore_saved_geometry()
+        if self.buddy_visible:
+            self._ensure_buddy_window()
+            self.root.after(120, self._place_buddy_window)
         if self.debug_visible:
             self._ensure_debug_window()
             self.root.after(120, self._place_debug_window)
@@ -648,6 +755,12 @@ class CompanionApp:
         settings: dict[str, object] = {
             "version": 1,
             "debug": False,
+            "buddy": {
+                "visible": True,
+            },
+            "text": {
+                "visible": True,
+            },
             "window": {
                 "docked": True,
                 "x": None,
@@ -668,6 +781,18 @@ class CompanionApp:
         if isinstance(payload.get("debug"), bool):
             settings["debug"] = payload["debug"]
 
+        buddy_payload = payload.get("buddy")
+        if isinstance(buddy_payload, dict):
+            buddy_settings = settings["buddy"]
+            if isinstance(buddy_payload.get("visible"), bool):
+                buddy_settings["visible"] = buddy_payload["visible"]
+
+        text_payload = payload.get("text")
+        if isinstance(text_payload, dict):
+            text_settings = settings["text"]
+            if isinstance(text_payload.get("visible"), bool):
+                text_settings["visible"] = text_payload["visible"]
+
         window_payload = payload.get("window")
         if isinstance(window_payload, dict):
             window_settings = settings["window"]
@@ -687,6 +812,22 @@ class CompanionApp:
         self.settings["window"] = window_settings
         return window_settings
 
+    def _buddy_settings(self) -> dict[str, object]:
+        buddy_settings = self.settings.get("buddy")
+        if isinstance(buddy_settings, dict):
+            return buddy_settings
+        buddy_settings = {"visible": True}
+        self.settings["buddy"] = buddy_settings
+        return buddy_settings
+
+    def _text_settings(self) -> dict[str, object]:
+        text_settings = self.settings.get("text")
+        if isinstance(text_settings, dict):
+            return text_settings
+        text_settings = {"visible": True}
+        self.settings["text"] = text_settings
+        return text_settings
+
     def _save_settings(self) -> None:
         window_settings = self._window_settings()
         window_settings["docked"] = self.docked
@@ -694,6 +835,8 @@ class CompanionApp:
             window_settings["x"] = int(self.root.winfo_x())
             window_settings["y"] = int(self.root.winfo_y())
         self.settings["debug"] = self.debug_visible
+        self._buddy_settings()["visible"] = self.buddy_visible
+        self._text_settings()["visible"] = self.text_visible
         try:
             self.settings_path.write_text(json.dumps(self.settings, indent=2) + "\n", encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
@@ -718,18 +861,21 @@ class CompanionApp:
             x = min(max(x, left), max(left, right - width))
             y = min(max(y, top), max(top, bottom - height))
         self.root.geometry(f"+{x}+{y}")
-        self._place_debug_window()
+        self._place_aux_windows()
 
     def _remember_window_position(self, *, docked: bool | None = None) -> None:
         if docked is not None:
             self.docked = docked
         self._save_settings()
-        self._place_debug_window()
+        self._place_aux_windows()
 
     def _build_ui(self) -> None:
         self.art_font = tkfont.Font(family="Consolas", size=9, weight="bold")
         self.quote_font = tkfont.Font(family="Consolas", size=7)
         self.debug_font = tkfont.Font(family="Consolas", size=8)
+        self.buddy_title_font = tkfont.Font(family="Segoe UI Semibold", size=10)
+        self.buddy_body_font = tkfont.Font(family="Segoe UI", size=8)
+        self.buddy_state_font = tkfont.Font(family="Consolas", size=8)
         initial_art = BOOT_FRAMES[0]
         width, height = self._measure_text(initial_art, self.art_font)
 
@@ -747,7 +893,7 @@ class CompanionApp:
             0,
             0,
             text="",
-            fill=ART_SHADOW_COLOR,
+            fill=self.theme_palette["art_shadow_far"],
             font=self.art_font,
             anchor="nw",
             justify="left",
@@ -756,7 +902,7 @@ class CompanionApp:
             1,
             1,
             text=initial_art,
-            fill=ART_SHADOW_COLOR,
+            fill=self.theme_palette["art_shadow_near"],
             font=self.art_font,
             anchor="nw",
             justify="left",
@@ -765,7 +911,7 @@ class CompanionApp:
             0,
             0,
             text=initial_art,
-            fill=STATE_ART_COLORS["boot"],
+            fill=self.theme_palette["state_art_colors"]["boot"],
             font=self.art_font,
             anchor="nw",
             justify="left",
@@ -774,7 +920,7 @@ class CompanionApp:
             1,
             height + 4,
             text=STATE_QUOTES["boot"],
-            fill=QUOTE_SHADOW_COLOR,
+            fill=self.theme_palette["quote_shadow"],
             font=self.quote_font,
             anchor="nw",
             justify="left",
@@ -783,7 +929,7 @@ class CompanionApp:
             0,
             height + 3,
             text=STATE_QUOTES["boot"],
-            fill=STATE_QUOTE_COLORS["boot"],
+            fill=self.theme_palette["state_quote_colors"]["boot"],
             font=self.quote_font,
             anchor="nw",
             justify="left",
@@ -792,11 +938,15 @@ class CompanionApp:
         self._set_display("boot", initial_art)
 
         self.menu = tk.Menu(self.root, tearoff=False)
+        self.menu.add_command(label="Hide Menu", command=self._toggle_buddy_window)
+        self.buddy_menu_index = 0
+        self.menu.add_command(label="Hide Text", command=self._toggle_text)
+        self.text_menu_index = 1
         self.menu.add_command(label="Redock Above Clock", command=self._dock_above_clock)
         self.menu.add_command(label="Pause Sensing", command=self._toggle_pause)
-        self.pause_menu_index = 1
+        self.pause_menu_index = 3
         self.menu.add_command(label="Show Diagnostics", command=self._toggle_debug_window)
-        self.debug_menu_index = 2
+        self.debug_menu_index = 4
         self.menu.add_separator()
         self.menu.add_command(label="Quit Courier Pod", command=self._quit)
         self._update_menu_labels()
@@ -825,7 +975,7 @@ class CompanionApp:
         x = event.x_root - self.drag_offset[0]
         y = event.y_root - self.drag_offset[1]
         self.root.geometry(f"+{x}+{y}")
-        self._place_debug_window()
+        self._place_aux_windows()
 
     def _end_click(self, _event: tk.Event[tk.Misc]) -> None:
         if self.drag_moved:
@@ -848,6 +998,8 @@ class CompanionApp:
             self.menu.grab_release()
 
     def _update_menu_labels(self) -> None:
+        self.menu.entryconfigure(self.buddy_menu_index, label="Hide Menu" if self.buddy_visible else "Show Menu")
+        self.menu.entryconfigure(self.text_menu_index, label="Hide Text" if self.text_visible else "Show Text")
         self.menu.entryconfigure(self.pause_menu_index, label="Resume Sensing" if self.paused else "Pause Sensing")
         self.menu.entryconfigure(self.debug_menu_index, label="Hide Diagnostics" if self.debug_visible else "Show Diagnostics")
 
@@ -874,7 +1026,7 @@ class CompanionApp:
         if save:
             self._remember_window_position(docked=True)
         else:
-            self._place_debug_window()
+            self._place_aux_windows()
 
     def _toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -915,6 +1067,25 @@ class CompanionApp:
         self._update_menu_labels()
         self._log_debug("diagnostics shown")
 
+    def _toggle_buddy_window(self) -> None:
+        if self.buddy_visible:
+            self._hide_buddy_window()
+            return
+        self.buddy_visible = True
+        self._ensure_buddy_window()
+        self._save_settings()
+        self._update_menu_labels()
+        self._log_debug("desktop buddy shown")
+
+    def _toggle_text(self) -> None:
+        self.text_visible = not self.text_visible
+        self._save_settings()
+        self._update_menu_labels()
+        current_state = self._current_state()
+        art = self.canvas.itemcget(self.art_item, "text") or self._frames_for_state(current_state)[0]
+        self._set_display(current_state, art)
+        self._log_debug("pod text shown" if self.text_visible else "pod text hidden")
+
     def _ensure_debug_window(self) -> None:
         if self.debug_window is not None and self.debug_window.winfo_exists():
             self._place_debug_window()
@@ -923,7 +1094,6 @@ class CompanionApp:
 
         self.debug_window = tk.Toplevel(self.root)
         self.debug_window.title("Courier Diagnostics")
-        self.debug_window.configure(bg="#0c130f", highlightbackground="#243228", highlightthickness=1)
         self.debug_window.resizable(False, False)
         self.debug_window.attributes("-topmost", True)
         try:
@@ -935,32 +1105,29 @@ class CompanionApp:
         except tk.TclError:
             pass
 
-        summary_label = tk.Label(
+        self.debug_summary_label = tk.Label(
             self.debug_window,
             textvariable=self.debug_summary_var,
-            bg="#0c130f",
-            fg="#d3e8c9",
             font=self.debug_font,
             justify="left",
             anchor="nw",
         )
-        summary_label.pack(fill="both", expand=False, padx=10, pady=(10, 6))
+        self.debug_summary_label.pack(fill="both", expand=False, padx=10, pady=(10, 6))
 
-        divider = tk.Frame(self.debug_window, height=1, bg="#243228", bd=0, highlightthickness=0)
-        divider.pack(fill="x", padx=10, pady=(0, 6))
+        self.debug_divider = tk.Frame(self.debug_window, height=1, bd=0, highlightthickness=0)
+        self.debug_divider.pack(fill="x", padx=10, pady=(0, 6))
 
-        log_label = tk.Label(
+        self.debug_log_label = tk.Label(
             self.debug_window,
             textvariable=self.debug_log_var,
-            bg="#0c130f",
-            fg="#7fa07b",
             font=self.debug_font,
             justify="left",
             anchor="nw",
         )
-        log_label.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.debug_log_label.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.debug_window.protocol("WM_DELETE_WINDOW", self._hide_debug_window)
+        self._apply_debug_theme()
         self._place_debug_window()
         self._refresh_debug_view(force=True)
 
@@ -972,6 +1139,307 @@ class CompanionApp:
         self._save_settings()
         self._update_menu_labels()
         self._refresh_debug_view()
+
+    def _ensure_buddy_window(self) -> None:
+        if self.buddy_window is not None and self.buddy_window.winfo_exists():
+            self._place_buddy_window()
+            self._refresh_buddy_labels()
+            return
+
+        self.buddy_window = tk.Toplevel(self.root)
+        self.buddy_window.title("Desktop Buddy")
+        self.buddy_window.resizable(False, False)
+        self.buddy_window.attributes("-topmost", True)
+        try:
+            self.buddy_window.wm_attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        try:
+            self.buddy_window.wm_attributes("-alpha", 0.97)
+        except tk.TclError:
+            pass
+
+        self.buddy_body_frame = tk.Frame(self.buddy_window, bd=0, highlightthickness=0)
+        self.buddy_body_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        self.buddy_title_label = tk.Label(
+            self.buddy_body_frame,
+            text="Pocket menu",
+            font=self.buddy_title_font,
+            anchor="w",
+            justify="left",
+        )
+        self.buddy_title_label.pack(fill="x")
+
+        self.buddy_copy_label = tk.Label(
+            self.buddy_body_frame,
+            text="A small field kit for cleanup, scan-ups, and fast handoffs.",
+            font=self.buddy_body_font,
+            anchor="w",
+            justify="left",
+            wraplength=248,
+        )
+        self.buddy_copy_label.pack(fill="x", pady=(4, 8))
+
+        self.buddy_state_label = tk.Label(
+            self.buddy_body_frame,
+            textvariable=self.buddy_state_var,
+            font=self.buddy_state_font,
+            anchor="w",
+            justify="left",
+        )
+        self.buddy_state_label.pack(fill="x", pady=(0, 10))
+
+        self.buddy_cards = []
+        self._add_buddy_card(
+            self.buddy_body_frame,
+            title="Clean files",
+            subtitle="Open a conservative Homebase cleanup thread. No blind deletes.",
+            accent="#87c76e",
+            command=self._launch_clean_files_flow,
+        )
+        self._add_buddy_card(
+            self.buddy_body_frame,
+            title="Safety scan",
+            subtitle="Request Defender quick scan and open a triage thread in parallel.",
+            accent="#d7b16d",
+            command=self._launch_safety_scan_flow,
+        )
+
+        self.buddy_status_label = tk.Label(
+            self.buddy_body_frame,
+            textvariable=self.buddy_status_var,
+            font=self.buddy_body_font,
+            anchor="w",
+            justify="left",
+            wraplength=248,
+        )
+        self.buddy_status_label.pack(fill="x", pady=(10, 0))
+
+        self.buddy_window.protocol("WM_DELETE_WINDOW", self._hide_buddy_window)
+        self._apply_buddy_theme()
+        self._place_buddy_window()
+        self._refresh_buddy_labels()
+
+    def _hide_buddy_window(self) -> None:
+        self.buddy_visible = False
+        if self.buddy_window is not None and self.buddy_window.winfo_exists():
+            self.buddy_window.destroy()
+        self.buddy_window = None
+        self.buddy_body_frame = None
+        self.buddy_cards = []
+        self._save_settings()
+        self._update_menu_labels()
+        self._log_debug("desktop buddy hidden")
+
+    def _add_buddy_card(
+        self,
+        parent: tk.Misc,
+        *,
+        title: str,
+        subtitle: str,
+        accent: str,
+        command: object,
+    ) -> None:
+        card = tk.Frame(parent, bd=0, highlightthickness=1, cursor="hand2")
+        accent_bar = tk.Frame(card, width=4, bg=accent, bd=0, highlightthickness=0)
+        accent_bar.pack(side="left", fill="y")
+
+        text_frame = tk.Frame(card, bd=0, highlightthickness=0)
+        text_frame.pack(side="left", fill="both", expand=True, padx=(10, 12), pady=9)
+
+        title_label = tk.Label(
+            text_frame,
+            text=title,
+            font=self.buddy_title_font,
+            anchor="w",
+            justify="left",
+        )
+        title_label.pack(fill="x")
+
+        subtitle_label = tk.Label(
+            text_frame,
+            text=subtitle,
+            font=self.buddy_body_font,
+            anchor="w",
+            justify="left",
+            wraplength=212,
+        )
+        subtitle_label.pack(fill="x", pady=(2, 0))
+
+        card_info = {
+            "frame": card,
+            "text_frame": text_frame,
+            "title": title_label,
+            "subtitle": subtitle_label,
+            "accent_bar": accent_bar,
+            "accent": accent,
+            "command": command,
+            "hovered": False,
+        }
+        self.buddy_cards.append(card_info)
+        for widget in (card, text_frame, title_label, subtitle_label, accent_bar):
+            widget.bind("<Enter>", lambda _event, info=card_info: self._set_buddy_card_hover(info, True))
+            widget.bind("<Leave>", lambda _event, info=card_info: self._set_buddy_card_hover(info, False))
+            widget.bind("<Button-1>", lambda _event, info=card_info: self._run_buddy_card(info))
+        card.pack(fill="x", pady=(0, 8))
+        self._set_buddy_card_hover(card_info, False)
+
+    def _run_buddy_card(self, card_info: dict[str, object]) -> None:
+        self.nudge_until = time.monotonic() + PING_SECONDS
+        command = card_info.get("command")
+        if callable(command):
+            command()
+
+    def _set_buddy_card_hover(self, card_info: dict[str, object], hovered: bool) -> None:
+        card_info["hovered"] = hovered
+        palette = self.theme_palette
+        bg = palette["card_hover_bg"] if hovered else palette["card_bg"]
+        border = card_info.get("accent") if hovered else palette["card_border"]
+        for key in ("frame", "text_frame", "title", "subtitle"):
+            widget = card_info.get(key)
+            if isinstance(widget, tk.Misc):
+                widget.configure(bg=bg)
+        frame = card_info.get("frame")
+        if isinstance(frame, tk.Frame):
+            frame.configure(highlightbackground=border, highlightcolor=border)
+        title = card_info.get("title")
+        if isinstance(title, tk.Label):
+            title.configure(fg=palette["card_title"])
+        subtitle = card_info.get("subtitle")
+        if isinstance(subtitle, tk.Label):
+            subtitle.configure(fg=palette["card_subtitle"])
+
+    def _refresh_buddy_labels(self) -> None:
+        state = self._current_state()
+        phrase = self._quote_for_state(state) or STATE_QUOTES.get(state, state)
+        self.buddy_state_var.set(f"Pod says {phrase}.")
+
+    def _set_buddy_status(self, message: str) -> None:
+        self.buddy_status_var.set(message)
+        if self.buddy_window is not None and self.buddy_window.winfo_exists():
+            self.buddy_window.update_idletasks()
+
+    def _default_workspace(self, preferred: Path) -> Path:
+        if preferred.exists():
+            return preferred
+        return Path.home()
+
+    def _launch_codex_thread(self, prompt: str, workspace: Path) -> tuple[bool, str]:
+        target = self._default_workspace(workspace)
+        codex_url = f"codex://new?prompt={quote(prompt, safe='')}&path={quote(str(target), safe='')}"
+        try:
+            os.startfile(codex_url)
+        except OSError as exc:
+            return False, str(exc)
+        return True, str(target)
+
+    def _launch_defender_quick_scan(self) -> tuple[bool, str]:
+        scan_command = "try { Start-MpScan -ScanType QuickScan } catch { exit 1 }"
+        try:
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    scan_command,
+                ],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            return False, str(exc)
+        return True, "Defender quick scan requested."
+
+    def _launch_clean_files_flow(self) -> None:
+        ok, detail = self._launch_codex_thread(CLEAN_FILES_PROMPT, HOMEBASE_WORKSPACE)
+        if ok:
+            self._set_buddy_status("Opened a conservative Homebase cleanup thread.")
+            self._log_debug("desktop buddy opened clean-files flow")
+            return
+        self._set_buddy_status(f"Clean-files launch failed: {detail}")
+        self._log_debug(f"desktop buddy clean-files failed: {detail}")
+
+    def _launch_safety_scan_flow(self) -> None:
+        thread_ok, thread_detail = self._launch_codex_thread(SAFETY_SCAN_PROMPT, HOMEBASE_WORKSPACE)
+        scan_ok, scan_detail = self._launch_defender_quick_scan()
+        if thread_ok and scan_ok:
+            self._set_buddy_status("Safety scan requested. Defender is running in the background.")
+            self._log_debug("desktop buddy launched safety scan")
+            return
+        problems = []
+        if not scan_ok:
+            problems.append(f"scan: {scan_detail}")
+        if not thread_ok:
+            problems.append(f"thread: {thread_detail}")
+        detail = "; ".join(problems) if problems else "unknown launch issue"
+        self._set_buddy_status(f"Safety scan launch failed: {detail}")
+        self._log_debug(f"desktop buddy safety-scan failed: {detail}")
+
+    def _place_aux_windows(self) -> None:
+        self._place_buddy_window()
+        self._place_debug_window()
+
+    def _apply_debug_theme(self) -> None:
+        if self.debug_window is None or not self.debug_window.winfo_exists():
+            return
+        palette = self.theme_palette
+        self.debug_window.configure(
+            bg=palette["debug_bg"],
+            highlightbackground=palette["debug_border"],
+            highlightcolor=palette["debug_border"],
+            highlightthickness=1,
+        )
+        if self.debug_summary_label is not None:
+            self.debug_summary_label.configure(bg=palette["debug_bg"], fg=palette["debug_text"])
+        if self.debug_log_label is not None:
+            self.debug_log_label.configure(bg=palette["debug_bg"], fg=palette["debug_muted"])
+        if self.debug_divider is not None:
+            self.debug_divider.configure(bg=palette["debug_border"])
+
+    def _apply_buddy_theme(self) -> None:
+        if self.buddy_window is None or not self.buddy_window.winfo_exists():
+            return
+        palette = self.theme_palette
+        self.buddy_window.configure(
+            bg=palette["buddy_bg"],
+            highlightbackground=palette["buddy_border"],
+            highlightcolor=palette["buddy_border"],
+            highlightthickness=1,
+        )
+        if self.buddy_body_frame is not None:
+            self.buddy_body_frame.configure(bg=palette["buddy_bg"])
+        for widget, fg_key in (
+            (self.buddy_title_label, "buddy_title"),
+            (self.buddy_copy_label, "buddy_copy"),
+            (self.buddy_state_label, "buddy_status"),
+            (self.buddy_status_label, "buddy_status"),
+        ):
+            if widget is not None:
+                widget.configure(bg=palette["buddy_bg"], fg=palette[fg_key])
+        for card_info in self.buddy_cards:
+            self._set_buddy_card_hover(card_info, bool(card_info.get("hovered")))
+
+    def _refresh_theme(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_theme_check_at < THEME_CHECK_INTERVAL:
+            return
+        self.last_theme_check_at = now
+        theme_mode = windows_apps_theme_mode()
+        if not force and theme_mode == self.theme_mode:
+            return
+        self.theme_mode = theme_mode
+        self.theme_palette = THEME_PALETTES[theme_mode]
+        self._apply_debug_theme()
+        self._apply_buddy_theme()
+        if hasattr(self, "canvas"):
+            current_state = self._current_state()
+            art = self.canvas.itemcget(self.art_item, "text") or self._frames_for_state(current_state)[0]
+            self._set_display(current_state, art)
+        self._log_debug(f"theme -> {theme_mode}")
 
     def _place_debug_window(self) -> None:
         if self.debug_window is None or not self.debug_window.winfo_exists():
@@ -988,6 +1456,24 @@ class CompanionApp:
             x = min(max(x, left + 8), max(left + 8, right - width - 8))
             y = min(max(y, top + 8), max(top + 8, bottom - height - 8))
         self.debug_window.geometry(f"+{x}+{y}")
+
+    def _place_buddy_window(self) -> None:
+        if self.buddy_window is None or not self.buddy_window.winfo_exists():
+            return
+        self.root.update_idletasks()
+        self.buddy_window.update_idletasks()
+        width = self.buddy_window.winfo_reqwidth()
+        height = self.buddy_window.winfo_reqheight()
+        x = self.root.winfo_x() + self.root.winfo_width() - width
+        y = self.root.winfo_y() - height - 16
+        area = windows_work_area()
+        if area is not None:
+            left, top, right, bottom = area
+            if y < top + 8:
+                y = min(self.root.winfo_y() + self.root.winfo_height() + 14, bottom - height - 8)
+            x = min(max(x, left + 8), max(left + 8, right - width - 8))
+            y = min(max(y, top + 8), max(top + 8, bottom - height - 8))
+        self.buddy_window.geometry(f"+{x}+{y}")
 
     def _age_text(self, timestamp: float) -> str:
         if timestamp <= 0.0:
@@ -1134,6 +1620,8 @@ class CompanionApp:
         return width, height
 
     def _quote_for_state(self, state: str) -> str:
+        if not self.text_visible:
+            return ""
         if state == "tooling":
             return self._tooling_quote()
         if state == "building":
@@ -1248,6 +1736,7 @@ class CompanionApp:
         quote = self._quote_for_state(state)
         pad_x = 2
         pad_y = 2
+        palette = self.theme_palette
         layout_key = (state, art, quote)
         layout = self.display_layout_cache.get(layout_key)
         if layout is None:
@@ -1263,19 +1752,22 @@ class CompanionApp:
             self.display_layout_cache[layout_key] = layout
         content_width, content_height, art_x, quote_x, quote_y, hit_rects = layout
         self.canvas.configure(width=content_width + 4, height=content_height + 4)
-        self.canvas.itemconfigure(self.shadow_far_item, text="")
-        self.canvas.itemconfigure(self.shadow_near_item, text=art, fill=ART_SHADOW_COLOR)
-        self.canvas.itemconfigure(self.art_item, text=art, fill=STATE_ART_COLORS[state])
-        self.canvas.coords(self.shadow_far_item, 0, 0)
+        far_shadow = palette["art_shadow_far"]
+        self.canvas.itemconfigure(self.shadow_far_item, text=art if far_shadow else "", fill=far_shadow)
+        self.canvas.itemconfigure(self.shadow_near_item, text=art, fill=palette["art_shadow_near"])
+        self.canvas.itemconfigure(self.art_item, text=art, fill=palette["state_art_colors"][state])
+        self.canvas.coords(self.shadow_far_item, art_x - 1, pad_y)
         self.canvas.coords(self.shadow_near_item, art_x + 1, pad_y + 1)
         self.canvas.coords(self.art_item, art_x, pad_y)
-        self.canvas.itemconfigure(self.quote_shadow_item, text=quote, fill=QUOTE_SHADOW_COLOR)
-        self.canvas.itemconfigure(self.quote_item, text=quote, fill=STATE_QUOTE_COLORS[state])
+        self.canvas.itemconfigure(self.quote_shadow_item, text=quote, fill=palette["quote_shadow"])
+        self.canvas.itemconfigure(self.quote_item, text=quote, fill=palette["state_quote_colors"][state])
         self.canvas.coords(self.quote_shadow_item, quote_x + 1, quote_y + 1)
         self.canvas.coords(self.quote_item, quote_x, quote_y)
         self.hit_rects = list(hit_rects)
+        self._refresh_buddy_labels()
 
     def _animate(self) -> None:
+        self._refresh_theme()
         state = self._current_state()
         frames = self._frames_for_state(state)
         self.frame_index = (getattr(self, "frame_index", -1) + 1) % len(frames)

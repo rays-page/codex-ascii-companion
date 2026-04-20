@@ -35,9 +35,19 @@ For a clean restart:
 
 - Left click: brief acknowledgement animation
 - Double click: redock above the clock
-- Right click: redock, pause/resume sensing, diagnostics toggle, quit
+- Right click: menu toggle, text toggle, redock, pause/resume sensing, diagnostics toggle, quit
 - Pause/resume: clears stale snapshots and forces a fresh resync against the current Codex process tree
 - Position: remembers the last dragged location and whether the pod was docked
+- Theme sync: shadow treatment and window surfaces follow the Windows app light/dark theme instead of using one fixed drop shadow everywhere
+- Text toggle: lets you hide the pod caption entirely if you want the character to stay visual-only
+
+## Desktop Buddy
+
+The attached menu stays visually tied to the pod instead of becoming a dashboard.
+
+- `Clean files`: opens a Codex thread aimed at `Homebase` with a conservative file-organization prompt
+- `Safety scan`: requests a Microsoft Defender quick scan in the background and opens a safety-triage Codex thread in parallel
+- Both actions are intentionally light-touch: they launch safe workflows, not blind cleanup or destructive host actions
 
 ## Sensing Model
 
