@@ -14,19 +14,22 @@ import tkinter.font as tkfont
 
 
 SPI_GETWORKAREA = 0x0030
-POLL_MS = 1800
+POLL_MS = 700
 FRAME_MS = 260
-BUSY_HOLD_SECONDS = 4.0
+BUSY_HOLD_SECONDS = 1.6
 ERROR_HOLD_SECONDS = 6.0
 TRANSPARENT_KEY = "#010203"
+RGN_OR = 2
+HIT_PAD_X = 3
+HIT_PAD_Y = 2
 IGNORED_CODEX_CHILD_STEMS = {"conhost"}
 IGNORED_CODEX_COMMAND_SNIPPETS = ("-encodedcommand",)
 STATE_QUOTES = {
-    "boot": "waking up",
-    "idle": "on watch",
+    "boot": "syncing",
+    "idle": "standing by",
     "ping": "with you",
-    "paused": "quiet mode",
-    "error": "hit a snag",
+    "paused": "sensing off",
+    "error": "lost sync",
 }
 STATE_ART_COLORS = {
     "boot": "#c8e6ff",
@@ -311,20 +314,22 @@ class CompanionApp:
         self.drag_start = (0, 0)
         self.drag_moved = False
         self.paused = False
-        self.busy_until = time.monotonic() + 1.2
+        self._start_time = time.monotonic()
+        self.busy_until = 0.0
         self.error_until = 0.0
         self.activity_hint = ""
         self.frame_index = 0
         self.last_snapshot: dict[int, tuple[str, float, str, int]] = {}
         self.self_pid = os.getpid()
-        self.poll_in_flight = False
+        self.poll_generation = 0
+        self.inflight_generation: int | None = None
         self.nudge_until = 0.0
 
         self._build_ui()
         self._bind_events()
         self._dock_above_clock()
         self.root.after(160, self._animate)
-        self.root.after(320, self._schedule_poll)
+        self.root.after(0, self._schedule_poll)
 
     def _build_ui(self) -> None:
         self.art_font = tkfont.Font(family="Consolas", size=9, weight="bold")
@@ -450,10 +455,14 @@ class CompanionApp:
 
     def _toggle_pause(self) -> None:
         self.paused = not self.paused
+        self.activity_hint = ""
+        self.busy_until = 0.0
+        self.error_until = 0.0
+        self.last_snapshot.clear()
+        self.poll_generation += 1
+        self.frame_index = 0
         if not self.paused:
-            self.error_until = 0.0
-            self.busy_until = time.monotonic() + 0.8
-            self._schedule_poll()
+            self.root.after(0, self._schedule_poll)
 
     def _current_state(self) -> str:
         now = time.monotonic()
@@ -507,6 +516,49 @@ class CompanionApp:
             return "building"
         return "at work"
 
+    def _visible_line_bounds(self, line: str, font: tkfont.Font) -> tuple[int, int] | None:
+        if not line.strip():
+            return None
+        first = next(index for index, char in enumerate(line) if char != " ")
+        last = len(line.rstrip()) - 1
+        return font.measure(line[:first]), font.measure(line[: last + 1])
+
+    def _update_window_region(self, art: str, quote: str) -> None:
+        if os.name != "nt":
+            return
+        self.root.update_idletasks()
+        origin_x = self.canvas.winfo_x()
+        origin_y = self.canvas.winfo_y()
+        base_region = None
+        region_specs = (
+            (art.splitlines() or [""], self.art_font, origin_x, origin_y),
+            ((quote.splitlines() or [""]) if quote else [], self.quote_font, origin_x, origin_y + self._measure_text(art, self.art_font)[1] + 3),
+        )
+        for lines, font, x_origin, y_origin in region_specs:
+            line_height = font.metrics("linespace")
+            for row, line in enumerate(lines):
+                bounds = self._visible_line_bounds(line, font)
+                if bounds is None:
+                    continue
+                left, right = bounds
+                top = y_origin + (row * line_height)
+                region = ctypes.windll.gdi32.CreateRectRgn(
+                    x_origin + left - HIT_PAD_X,
+                    top - HIT_PAD_Y,
+                    x_origin + right + HIT_PAD_X + 3,
+                    top + line_height + HIT_PAD_Y + 3,
+                )
+                if base_region is None:
+                    base_region = region
+                else:
+                    ctypes.windll.gdi32.CombineRgn(base_region, base_region, region, RGN_OR)
+                    ctypes.windll.gdi32.DeleteObject(region)
+        if base_region is None:
+            ctypes.windll.user32.SetWindowRgn(self.root.winfo_id(), 0, True)
+            return
+        if not ctypes.windll.user32.SetWindowRgn(self.root.winfo_id(), base_region, True):
+            ctypes.windll.gdi32.DeleteObject(base_region)
+
     def _set_display(self, state: str, art: str) -> None:
         art_width, art_height = self._measure_text(art, self.art_font)
         quote = self._quote_for_state(state)
@@ -524,6 +576,7 @@ class CompanionApp:
         self.canvas.itemconfigure(self.quote_item, text=quote, fill=STATE_QUOTE_COLORS[state])
         self.canvas.coords(self.quote_shadow_item, 2, art_height + 4)
         self.canvas.coords(self.quote_item, 1, art_height + 3)
+        self._update_window_region(art, quote)
 
     def _animate(self) -> None:
         state = self._current_state()
@@ -534,21 +587,20 @@ class CompanionApp:
 
     @property
     def start_time(self) -> float:
-        if not hasattr(self, "_start_time"):
-            self._start_time = time.monotonic()
         return self._start_time
 
     def _schedule_poll(self) -> None:
         if self.paused:
             return
-        if self.poll_in_flight:
+        if self.inflight_generation == self.poll_generation:
             self.root.after(POLL_MS, self._schedule_poll)
             return
-        self.poll_in_flight = True
-        worker = threading.Thread(target=self._poll_processes, daemon=True)
+        generation = self.poll_generation
+        self.inflight_generation = generation
+        worker = threading.Thread(target=self._poll_processes, args=(generation,), daemon=True)
         worker.start()
 
-    def _poll_processes(self) -> None:
+    def _poll_processes(self, generation: int) -> None:
         command = (
             "$cpuById = @{}; "
             "Get-Process | ForEach-Object { "
@@ -576,7 +628,7 @@ class CompanionApp:
         except Exception as exc:  # noqa: BLE001
             active_name = ""
             error_text = str(exc)
-        self.root.after(0, lambda: self._apply_poll_result(active_name, error_text))
+        self.root.after(0, lambda: self._apply_poll_result(generation, active_name, error_text))
 
     def _normalize_snapshot(self, payload: str) -> list[dict[str, object]]:
         if not payload:
@@ -590,6 +642,14 @@ class CompanionApp:
 
     def _process_stem(self, name: str) -> str:
         return Path(name).stem.lower()
+
+    def _hint_from_process(self, stem: str, command_line: str) -> str:
+        lowered = command_line.lower()
+        if stem in {"powershell", "cmd"}:
+            for tool_name in ("git", "python", "py", "node", "npm", "pnpm", "cargo", "rustc", "msbuild", "devenv", "uv"):
+                if tool_name in lowered:
+                    return tool_name
+        return stem
 
     def _is_codex_root(self, name: str, command_line: str) -> bool:
         return self._process_stem(name) == "codex" and "app-server" in command_line.lower()
@@ -628,6 +688,7 @@ class CompanionApp:
 
         active_hint = ""
         best_score = 0.0
+        best_hint = ""
         seen: set[int] = set()
         queue = list(roots)
         while queue:
@@ -644,20 +705,30 @@ class CompanionApp:
             stem = self._process_stem(name)
             if self._ignore_codex_child(stem, command_line):
                 continue
+            hint = self._hint_from_process(stem, command_line)
             previous = self.last_snapshot.get(pid)
             if previous is None:
                 score = 0.08
             else:
-                score = cpu - previous[1]
+                score = max(cpu - previous[1], 0.0)
             if score > best_score and score >= 0.03:
-                active_hint = stem
+                active_hint = hint
                 best_score = score
+            if not best_hint:
+                best_hint = hint
+        if not active_hint:
+            active_hint = best_hint
 
         self.last_snapshot = next_snapshot
         return active_hint
 
-    def _apply_poll_result(self, active_name: str, error_text: str) -> None:
-        self.poll_in_flight = False
+    def _apply_poll_result(self, generation: int, active_name: str, error_text: str) -> None:
+        if self.inflight_generation == generation:
+            self.inflight_generation = None
+        if generation != self.poll_generation:
+            if not self.paused:
+                self.root.after(0, self._schedule_poll)
+            return
         if error_text:
             self.error_until = time.monotonic() + ERROR_HOLD_SECONDS
         else:

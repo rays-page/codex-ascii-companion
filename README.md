@@ -21,9 +21,10 @@ pythonw .\codex_ascii_companion.pyw
 
 - Left click: little acknowledgement animation
 - Double click: redock above the clock
-- Right click: menu with pause and quit
+- Right click: menu with pause, resume, and quit
 - Working state: driven by active child processes under `codex.exe app-server`
-- Idle state: Codex is open but not actively running visible agent work
+- Idle state: shown as `standing by` when Codex is not actively running visible agent work
+- Resume sensing: clears stale state and immediately resyncs with the current Codex process tree
 
 ## Notes
 
