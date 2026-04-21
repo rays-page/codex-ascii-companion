@@ -1,24 +1,27 @@
 # Codex ASCII Companion
 
-Codex ASCII Companion is a small transparent Windows desktop companion for Codex.
+Codex ASCII Companion is a transparent Windows desktop companion that turns local Codex activity into a tiny ambient UI.
 
-It lives near the system clock and reflects the state of the local Codex runtime with lightweight ASCII animation instead of a full dashboard. The companion watches the real `codex.exe app-server` process tree, so it reacts to actual work rather than simply checking whether the Codex app window is open.
+Instead of another dashboard, it lives near the system clock and reflects the state of the local Codex runtime with lightweight ASCII animation. The companion watches the real `codex.exe app-server` process tree, so it reacts to actual work rather than simply checking whether the Codex app window is open.
 
 ## Preview
 
 <table>
   <tr>
-    <td width="34%"><img src="docs/readme/codex-ascii-companion-screenshot.png" alt="Live Codex ASCII Companion desktop screenshot"></td>
-    <td width="66%"><img src="docs/readme/codex-ascii-companion-graphic.png" alt="Codex ASCII Companion abstract graphic"></td>
+    <td width="28%"><img src="docs/readme/codex-ascii-companion-screenshot.png" alt="Live Codex ASCII Companion desktop screenshot"></td>
+    <td width="72%"><img src="docs/readme/codex-ascii-companion-graphic.png" alt="Codex ASCII Companion abstract graphic"></td>
+  </tr>
+  <tr>
+    <td colspan="2">The live pod is intentionally tiny on screen. The screenshot shows its real desktop scale, while the companion graphic makes the interaction concept easier to scan in a GitHub README.</td>
   </tr>
 </table>
 
-## Why This Repo Matters
+## What This Repo Demonstrates
 
-- It turns local runtime signals into a calm, readable desktop presence.
-- It distinguishes real work states such as `thinking`, `tooling`, `building`, and `waiting`.
-- It includes an optional diagnostics surface for understanding why a state was chosen.
-- It is built with standard-library Python plus `tkinter`, with no heavyweight desktop framework.
+- Translating noisy local runtime signals into a calm, readable desktop presence
+- Distinguishing real work states such as `thinking`, `tooling`, `building`, and `waiting`
+- Keeping the always-on surface intentionally tiny while exposing deeper diagnostics separately
+- Shipping a lightweight desktop utility with standard-library Python plus `tkinter`
 
 ## Features
 
