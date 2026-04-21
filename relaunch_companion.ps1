@@ -7,15 +7,18 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $scriptDir "codex_ascii_companion.pyw"
-$preferredPythonw = "C:\Users\raymo_w9whwcn\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe"
+$pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
 
-if (Test-Path -LiteralPath $preferredPythonw) {
-    $pythonw = $preferredPythonw
-} else {
-    $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pythonw) {
-        throw "pythonw.exe was not found. Update relaunch_companion.ps1 with the correct interpreter path."
+if (-not $pythonw) {
+    $localPythonRoot = Join-Path $env:LOCALAPPDATA "Python"
+    if (Test-Path -LiteralPath $localPythonRoot) {
+        $pythonw = Get-ChildItem -Path $localPythonRoot -Recurse -Filter pythonw.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
     }
+}
+
+if (-not $pythonw) {
+    throw "pythonw.exe was not found. Install Python or add pythonw.exe to PATH before using the relaunch helper."
 }
 
 Get-CimInstance Win32_Process |

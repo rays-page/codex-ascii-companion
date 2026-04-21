@@ -1,15 +1,30 @@
 # Codex ASCII Companion
 
-Small transparent Windows desktop companion for Codex.
+Codex ASCII Companion is a small transparent Windows desktop companion for Codex.
 
-It stays out of the way, lives near the clock, and reacts to real `codex.exe app-server` work instead of merely noticing that the Codex app is open.
+It lives near the system clock and reflects the state of the local Codex runtime with lightweight ASCII animation instead of a full dashboard. The companion watches the real `codex.exe app-server` process tree, so it reacts to actual work rather than simply checking whether the Codex app window is open.
 
-## Files
+## Why This Repo Matters
 
-- `codex_ascii_companion.pyw`: standalone companion app
-- `codex_courier_pod.ico`: generated icon used by the window and shortcut
-- `relaunch_companion.ps1`: clean stop/start helper for the running companion
-- `companion_settings.json`: local position/debug settings file written at runtime and ignored by git
+- It turns local runtime signals into a calm, readable desktop presence.
+- It distinguishes real work states such as `thinking`, `tooling`, `building`, and `waiting`.
+- It includes an optional diagnostics surface for understanding why a state was chosen.
+- It is built with standard-library Python plus `tkinter`, with no heavyweight desktop framework.
+
+## Features
+
+- Transparent always-on-top companion pod with tiny ASCII state art
+- Runtime-aware sensing based on Codex process activity
+- Confidence-gated state selection so weak signals stay `idle`
+- Optional diagnostics window for rollout reasoning hits, process hints, and recent trace decisions
+- Docking, pause/resume, caption toggle, and theme-aware styling
+- Lightweight local actions that can be adapted or removed for a different setup
+
+## Requirements
+
+- Windows
+- Codex installed locally
+- Python 3 with `pythonw.exe` available
 
 ## Run
 
@@ -31,56 +46,53 @@ For a clean restart:
 .\relaunch_companion.ps1
 ```
 
-## Behavior
+## Interaction Model
 
 - Left click: brief acknowledgement animation
 - Double click: redock above the clock
-- Right click: menu toggle, text toggle, redock, pause/resume sensing, diagnostics toggle, quit
-- Pause/resume: clears stale snapshots and forces a fresh resync against the current Codex process tree
-- Position: remembers the last dragged location and whether the pod was docked
-- Theme sync: shadow treatment and window surfaces follow the Windows app light/dark theme instead of using one fixed drop shadow everywhere
-- Text toggle: lets you hide the pod caption entirely if you want the character to stay visual-only
+- Right click: open the companion menu
+- Pause/resume: clear stale snapshots and force a fresh resync against the current Codex process tree
+- Position memory: remember the last dragged location and docked state
+- Theme sync: adapt shadows and surfaces to the Windows app theme
+- Text toggle: hide the caption if you want a visual-only companion
 
-## Desktop Buddy
+## State Model
 
-The attached menu stays visually tied to the pod instead of becoming a dashboard.
+The pod derives its state from observable runtime signals:
 
-- `Clean files`: opens a Codex thread aimed at `Homebase` with a conservative file-organization prompt
-- `Safety scan`: requests a Microsoft Defender quick scan in the background and opens a safety-triage Codex thread in parallel
-- Both actions are intentionally light-touch: they launch safe workflows, not blind cleanup or destructive host actions
-
-## Sensing Model
-
-The pod derives its state from observable Codex runtime signals:
-
-- `thinking`: only in root-work cases with no stronger child-path evidence; it prefers a fresh rollout reasoning hit and otherwise falls back to sustained `codex.exe app-server` CPU
-- `tooling`: descendant activity must look meaningful, not just like shell presence; live child-path evidence keeps `thinking` suppressed
-- `building`: descendant commands must look compile/bundle/build-like and actually be active
-- `waiting`: descendant processes still exist, but only after earlier meaningful work has gone quiet
+- `thinking`: root work with no stronger child-tool evidence
+- `tooling`: meaningful descendant activity such as shells or utility processes
+- `building`: compile, bundle, or build-like work
+- `waiting`: processes still exist, but active work has gone quiet
 - `delivered`: short handoff glow after visible work settles
-- `idle`: the default whenever signals are weak or ambiguous
+- `idle`: default state when signals are weak or ambiguous
 
 ## Diagnostics
 
-Diagnostics are optional and live outside the main companion so the desktop presence stays clean. The diagnostics window shows:
+Diagnostics stay outside the main companion so the desktop surface remains clean. The debug window shows:
 
 - current derived state
-- strongest candidate state when it lost the confidence gate
-- activity hint
-- reasoning string
+- strongest rejected candidate
+- activity hint and reasoning string
 - rollout reasoning hit or miss, age, and source
-- last active process source
-- poll generation / inflight generation
 - root CPU delta
-- descendant counts broken into meaningful, shell, build, and quiet buckets
-- rolling sensor trace with recent polls, chosen/candidate state, and rejected reasons
+- descendant counts by category
+- recent trace decisions and rejected reasons
 - last error
 
-Live validation on 2026-04-20 confirmed the diagnostics surface can show a real rollout-backed `thinking` transition, clear back out after the answer lands, and still suppress `thinking` when a live child tool path is present.
-When diagnostics are hidden, the companion now skips rebuilding the diagnostics text until that window is shown again.
-When no live `codex.exe app-server` is present, the poll loop now backs off slightly to reduce idle overhead.
+## Local Customization
 
-## Notes
+The bundled menu actions are intentionally lightweight examples of local automation. They are safe to remove, replace, or adapt for a different workspace.
 
-- Pure standard-library Python
-- Built for Windows desktop use
+## Files
+
+- `codex_ascii_companion.pyw`: standalone companion app
+- `codex_courier_pod.ico`: icon used by the window and shortcut
+- `relaunch_companion.ps1`: stop/start helper for the running companion
+- `companion_settings.json`: local position and debug settings written at runtime and ignored by git
+
+## Limitations
+
+- Tuned for Windows desktop use
+- Tuned to the current Codex runtime/process shape
+- Heuristic sensing can drift if the underlying process model changes
