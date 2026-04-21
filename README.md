@@ -4,6 +4,15 @@ Codex ASCII Companion is a small transparent Windows desktop companion for Codex
 
 It lives near the system clock and reflects the state of the local Codex runtime with lightweight ASCII animation instead of a full dashboard. The companion watches the real `codex.exe app-server` process tree, so it reacts to actual work rather than simply checking whether the Codex app window is open.
 
+## Preview
+
+<table>
+  <tr>
+    <td width="34%"><img src="docs/readme/codex-ascii-companion-screenshot.png" alt="Live Codex ASCII Companion desktop screenshot"></td>
+    <td width="66%"><img src="docs/readme/codex-ascii-companion-graphic.png" alt="Codex ASCII Companion abstract graphic"></td>
+  </tr>
+</table>
+
 ## Why This Repo Matters
 
 - It turns local runtime signals into a calm, readable desktop presence.
