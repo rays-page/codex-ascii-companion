@@ -9,7 +9,7 @@ Instead of another dashboard, it lives near the system clock and reflects the st
 <table>
   <tr>
     <td width="28%"><img src="docs/readme/codex-ascii-companion-screenshot.png" alt="Live Codex ASCII Companion desktop screenshot"></td>
-    <td width="72%"><img src="docs/readme/codex-ascii-companion-graphic.png" alt="Codex ASCII Companion abstract graphic"></td>
+    <td width="72%"><img src="docs/readme/codex-ascii-companion-colorfield.png" alt="Codex ASCII Companion abstract graphic"></td>
   </tr>
   <tr>
     <td colspan="2">The live pod is intentionally tiny on screen. The screenshot shows its real desktop scale, while the companion graphic makes the interaction concept easier to scan in a GitHub README.</td>
