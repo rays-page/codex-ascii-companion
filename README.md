@@ -2,6 +2,8 @@
 
 Codex ASCII Companion is a transparent Windows desktop companion that turns local Codex activity into a tiny ambient UI.
 
+This is a small supporting utility: useful as a local workflow companion, not a full productivity platform.
+
 Instead of another dashboard, it lives near the system clock and reflects the state of the local Codex runtime with lightweight ASCII animation. The companion watches the real `codex.exe app-server` process tree, so it reacts to actual work rather than simply checking whether the Codex app window is open.
 
 ## Preview
